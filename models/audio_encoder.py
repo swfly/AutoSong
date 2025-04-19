@@ -29,23 +29,17 @@ class AudioEncoder:
 
         # encoded_frames is a list of length C (num codebooks)
         # each element is (B, 1, T) → we squeeze batch and stack as (C, T)
-        token_seq = torch.cat([code[0] for code in encoded_frames], dim=0)  # (C, T)
-        token_seq = token_seq.permute(1, 0).contiguous()  # → (T, C)
-        return token_seq  # int32 tokens
+        codebooks = encoded_frames[0][0]  # Shape: (1, C, T)
+        codebooks = codebooks.squeeze(0).permute(1, 0)  # → (T, C)
+        return codebooks.int().cpu()  # int32 tokens
 
     def decode(self, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Decode token sequence back to waveform.
+        tokens = tokens.to(self.device).int()                      # (T, K)
+        codes  = tokens.transpose(0, 1).unsqueeze(0)               # (1, K, T)
 
-        Args:
-            tokens: Tensor of shape (T, C) — must match Encodec's codebook count.
-
-        Returns:
-            Waveform tensor of shape (1, C, T) on CPU.
-        """
-        tokens = tokens.permute(1, 0).unsqueeze(0).to(self.device)  # (1, C, T)
-
+        encoded_frames = [(codes, getattr(self, "_last_scale", None))]
         with torch.no_grad():
-            audio = self.model.decode(tokens)
+            audio = self.model.decode(encoded_frames)              # (1, C, T)
 
-        return audio.cpu().squeeze(0)  # shape: (C, T)
+        return audio.squeeze(0).cpu()    
+
