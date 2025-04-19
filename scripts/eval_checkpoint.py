@@ -9,9 +9,9 @@ from models.audio_encoder import AudioEncoder
 from models.sound_transformer import SoundTransformer
 
 WINDOW = 4096
-WAV_PATH = "test.mp3"
-LYRICS = "hello boy"
-CKPT = "checkpoints/overfit_song.pt"
+WAV_PATH = "dataset/song_001/song_001.mp3"
+LYRICS = "明天你好"
+CKPT = "checkpoints/random_train.pt"
 VOCAB_PER_CB, EMB = 1024, 512
 MAX_TOKENS = 18_000
 
@@ -32,7 +32,7 @@ TOTAL_VOCAB = VOCAB_PER_CB * N_CODEBOOKS
 print(f"📦  {N_CODEBOOKS} EnCodec codebooks detected")
 
 model = SoundTransformer(VOCAB_PER_CB, N_CODEBOOKS, EMB,
-                         num_heads=4, num_layers=3,
+                         num_heads=4, num_layers=4,
                          max_seq_len=MAX_TOKENS).to(device).eval()
 model.load_state_dict(torch.load(CKPT, map_location=device), strict=True)
 
@@ -50,6 +50,7 @@ cache_len = 0
 print("🎼  generating …")
 with torch.inference_mode():
     for _ in range(SEQ - 1):
+        print('predicting',_)
         logits, past_kv = model(
             lyr_emb,
             gen[:, -1:],
@@ -75,7 +76,7 @@ print("🔊  decoding …")
 wave = aud_enc.decode(tokens2d)
 sr = aud_enc.sample_rate
 
-out = Path("reconstructed2.wav")
+out = Path("create.wav")
 torchaudio.save(out.as_posix(), wave, sr)
 print(f"✅  saved {out.resolve()}")
 

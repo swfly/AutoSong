@@ -4,7 +4,7 @@ from encodec.utils import convert_audio
 import torchaudio
 
 class AudioEncoder:
-    def __init__(self, device="cuda", sample_rate=24000, bandwidth=6.0):
+    def __init__(self, device="cuda", sample_rate=24000, bandwidth=1.5):
         self.device = device
         self.model = EncodecModel.encodec_model_24khz()
         self.model.set_target_bandwidth(bandwidth)

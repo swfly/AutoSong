@@ -1,0 +1,55 @@
+# ───────── Python ───────── #
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# ──────── Environments ──────── #
+.venv/
+env/
+venv/
+ENV/
+*.env
+
+# ──────── Checkpoints / Outputs ──────── #
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+reconstructed.wav
+output.wav
+test.wav
+
+# ──────── Data / Audio ──────── #
+*.mp3
+*.flac
+*.wav
+*.ogg
+
+# ──────── Notebooks ──────── #
+.ipynb_checkpoints/
+
+# ──────── VSCode / IDEs ──────── #
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ──────── OS / Misc ──────── #
+.DS_Store
+Thumbs.db
+codebase_review_prompt.txt
+
+# ──────── Transformers Cache (HF) ──────── #
+.cache/
+~/.cache/
+~/.huggingface/
+huggingface/
+
+# ──────── Torchaudio Temp ──────── #
+torchaudio_temp*
