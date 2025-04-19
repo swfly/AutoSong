@@ -16,7 +16,7 @@ class TextEncoder(nn.Module):
         with torch.no_grad():
             outputs = self.bert(**tokens)
         cls_embedding = outputs.last_hidden_state[:, 0, :]  # [CLS] token
-        return self.proj(cls_embedding)  # [1, 512]
+        return self.proj(cls_embedding).detach()  # [1, 512]
 
     def tokenize(self, text: str) -> torch.Tensor:
         """Tokenize a string and return token IDs."""

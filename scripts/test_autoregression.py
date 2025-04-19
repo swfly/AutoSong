@@ -1,7 +1,7 @@
 import torch
 from models.audio_encoder import AudioEncoder
 from models.text_encoder import TextEncoder
-from models.sound_transfomer import SoundTransformer
+from models.sound_transformer import SoundTransformer
 
 # --------------------------
 # Config

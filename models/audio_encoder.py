@@ -31,7 +31,7 @@ class AudioEncoder:
         # each element is (B, 1, T) → we squeeze batch and stack as (C, T)
         codebooks = encoded_frames[0][0]  # Shape: (1, C, T)
         codebooks = codebooks.squeeze(0).permute(1, 0)  # → (T, C)
-        return codebooks.int().cpu()  # int32 tokens
+        return codebooks.int().cpu().detach()  # int32 tokens
 
     def decode(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = tokens.to(self.device).int()                      # (T, K)

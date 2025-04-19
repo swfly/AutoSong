@@ -26,4 +26,5 @@ The aim is to validate whether lyrics and genre can meaningfully guide music gen
 - `/models/text_encoder.py`: Loads and encodes lyrics using pretrained BERT (HuggingFace)
 - `/models/audio_encoder.py`: Wraps Meta EnCodec to tokenize and reconstruct audio
 - `/models/sound_transformer.py`: GPT-style autoregressive decoder that predicts the next EnCodec token, conditioned on a fixed lyrics embedding and past audio tokens. Accepts a [lyrics_embedding] vector as external memory and autoregressively models temporal audio coherence via causal self-attention. Designed to support flat or interleaved token sequences from multiple EnCodec codebooks.
+- `/scripts/train_overfit.py`: Trains SoundTransformer to overfit a short music sample (~30 seconds) using flattened EnCodec tokens from 2 codebooks and corresponding lyrics. Validates whether the model can learn alignment between lyrics and the structure of the original song.
 ---
