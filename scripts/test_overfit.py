@@ -24,7 +24,6 @@ WAV_PATH = "test.mp3"
 LYRICS_TEXT = """I saw the sun rise over the hills and I felt peace."""
 CHECKPOINT_PATH = "checkpoints/overfit_song.pt"
 VOCAB_SIZE = 1024
-NUM_CODEBOOKS = 2
 EMBED_DIM = 512
 MAX_TOKENS = 18000  # depends on length of audio and flattening
 DEVICE = get_best_device()
