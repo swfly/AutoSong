@@ -9,7 +9,7 @@ from models.audio_encoder import AudioEncoder
 from models.sound_transformer import SoundTransformer
 
 WINDOW = 4096
-WAV_PATH = "test.mp3"
+WAV_PATH = "dataset/song_001/song_001.mp3"
 LYRICS = "hello boy"
 CKPT = "checkpoints/overfit_song.pt"
 VOCAB_PER_CB, EMB = 1024, 512
@@ -50,6 +50,7 @@ cache_len = 0
 print("🎼  generating …")
 with torch.inference_mode():
     for _ in range(SEQ - 1):
+        print("predicting",_)
         logits, past_kv = model(
             lyr_emb,
             gen[:, -1:],

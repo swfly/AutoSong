@@ -7,6 +7,46 @@ This project aims to explore whether a **GPT-style autoregressive transformer** 
 The system predicts audio **block-by-block** (e.g., using EnCodec tokens), using the **textual prompt as context** and previously generated audio blocks to model temporal coherence.
 
 In order to fully leverage the creativity of transformer, the lyrics is always provided in complete as memory prompt: it lets transformer to decide about the timing and structure of the song.
+```
+            +----------------------+
+            | User: Lyrics + Genre |
+            +----------------------+
+                       |
+                       v
+                +--------------+
+                | TextEncoder  |
+                +--------------+
+                       |
+                       v
+             +-------------------+
+             | Lyrics Embedding  |
+             +-------------------+
+                       |
+                       v
+   +-------------------------------------+
+   |         SoundTransformer           |
+   | (autoregressive decoder-only model) |
+   +-------------------------------------+
+        ^                    |
+        |                    v
+        |       +-----------------------+
+        |       | Audio Tokenization    |
+        |       |    (AudioEncoder)     |
+        |       +-----------------------+
+        |                    |
+        |                    v
+        +<---- Generated Tokens (1D) ----+
+                       |
+                       v
+                +--------------+
+                | AudioDecoder |  ← (same model)
+                +--------------+
+                       |
+                       v
+               +----------------+
+               |   Output WAV   |
+               +----------------+
+```
 ---
 
 ## 🎯 Goal of Initial Prototype
@@ -19,23 +59,41 @@ To build a **research-grade minimal system** that can:
    - `[lyrics_embedding] + [previous_audio_tokens]`
 4. Decode generated tokens into raw audio for listening
 
-The aim is to validate whether lyrics and genre can meaningfully guide music generation via a GPT-style model.
+The aim is to validate whether lyrics and genre can meaningfully guide music generation, in terms of a full composition, via a GPT-style model.
 
-## ✅ Completed Components
 
-- `/models/text_encoder.py`: Loads and encodes lyrics using pretrained BERT (HuggingFace)
-- `/models/audio_encoder.py`: Wraps Meta EnCodec to tokenize and reconstruct audio
-- `/models/sound_transformer.py`: GPT-style autoregressive decoder that predicts the next EnCodec token, conditioned on a fixed lyrics embedding and past audio tokens. Accepts a [lyrics_embedding] vector as external memory and autoregressively models temporal audio coherence via causal self-attention. Designed to support flat or interleaved token sequences from multiple EnCodec codebooks.
-- `/scripts/test_overfit.py`: Trains SoundTransformer to overfit a short music sample (~30 seconds) using flattened EnCodec tokens from 2 codebooks and corresponding lyrics. Validates whether the model can learn alignment between lyrics and the structure of the original song.
-- `/scripts/test_predict.py`: Sequentially predict and recover the overfitted song using the saved checkpoint to test the effect of learning.
-- `/scripts/train_dataset.py`: Do the actual training, see below.
----
+## 🎼 Why Full-Context Matters
+Unlike loop-based or short-sample music generators, this project is explicitly designed to model long-range musical structure — including:
+
+- Verse–chorus alternation
+
+- Global lyric-to-melody alignment
+
+- Energy curves that follow emotional arcs
+
+- Recurring motifs, phrasing, and tension-resolution patterns
+
+To enable this, the system is trained on entire song spans (up to 18,000 EnCodec tokens, ≈15–20 seconds of music) in a single transformer context window. This design choice:
+
+- Forces the model to learn compositional structure over time
+
+- Preserves the temporal relationship between lyrics and musical phrasing
+
+- Allows lyric-conditioned guidance across full sections of a song
+
+While this demands significantly more VRAM and compute than local models, it is essential to the goal of coherent music generation from start to finish.
+
+## Data Flow
+
+- Text encoder generates lyric tokens.
+- AudioEncoder generates a **complete** sequence of sound tokens using Meta's EnCodec.
+- Transformer takes Text as "memory" and predicts n+1-th sound token using previous n sound tokens.
+
 
 ## 🧪 Formal Full-Context Training
+This project includes a **formal training script** that performs full-sequence training with constant VRAM usage. The goal is to explore generalization from lyrics and genre across a dataset of diverse music tracks.
 
-In addition to overfitting a single example, this project includes a **formal training script** that performs full-sequence training with constant VRAM usage. The goal is to explore generalization from lyrics and genre across a dataset of diverse music tracks.
-
-### 🔧 Script: `scripts/train_full_context.py`
+### 🔧 Script: `scripts/train_dataset.py`
 
 This script:
 
@@ -77,5 +135,3 @@ dataset/
   - A `.mp3` or `.flac` audio file
 
 > ⚠️ Audio files are resampled to 24 kHz and tokenized using Meta’s EnCodec (24 kHz model).
-
-

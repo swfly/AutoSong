@@ -16,7 +16,7 @@ def get_best_device():
     else:
         return torch.device("cpu")
 
-WAV_PATH = "test.mp3"
+WAV_PATH = "dataset/song_001/song_001.mp3"
 LYRICS_TEXT = """I saw the sun rise over the hills and I felt peace."""
 CHECKPOINT_PATH = "checkpoints/overfit_song.pt"
 
