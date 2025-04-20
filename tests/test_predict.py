@@ -8,77 +8,76 @@ from models.text_encoder import TextEncoder
 from models.audio_encoder import AudioEncoder
 from models.sound_transformer import SoundTransformer
 
-WINDOW = 4096
+def get_best_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
 WAV_PATH = "dataset/song_001/song_001.mp3"
-LYRICS = "hello boy"
-CKPT = "checkpoints/overfit_song.pt"
-VOCAB_PER_CB, EMB = 1024, 512
-MAX_TOKENS = 18_000
+LYRICS_TEXT = """I saw the sun rise over the hills and I felt peace."""
+CHECKPOINT_PATH = "checkpoints/overfit_song.pt"
+DEVICE = get_best_device()
+text_encoder = TextEncoder().to(torch.device("cpu") if DEVICE.type == "mps" else DEVICE)
+audio_encoder = AudioEncoder(device=DEVICE)
+VOCAB_PER_CB = audio_encoder.vocab_size
+EMBED_DIM = 512
+MAX_TOKENS = 18000
+EPOCHS = 300
+LR = 1e-3
 
-device = (torch.device("cuda") if torch.cuda.is_available()
-          else torch.device("mps") if torch.backends.mps.is_available()
-          else torch.device("cpu"))
-print(f"🔌  device: {device}   │  sliding window: {WINDOW}")
+print("Encoding lyrics …")
+lyrics_embed = text_encoder.encode(LYRICS_TEXT).to(DEVICE)
 
-txt_enc = TextEncoder().to(torch.device("cpu") if device.type == "mps" else device)
-aud_enc = AudioEncoder(device=device)
-
-tokens2d = aud_enc.encode(WAV_PATH)
+print("Encoding audio …")
+tokens2d = audio_encoder.encode(WAV_PATH)  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
-offset = torch.arange(N_CODEBOOKS) * VOCAB_PER_CB
-ref = (tokens2d + offset).flatten()
-TOTAL_VOCAB = VOCAB_PER_CB * N_CODEBOOKS
+print(f"🔌  device: {DEVICE}")
 
-print(f"📦  {N_CODEBOOKS} EnCodec codebooks detected")
+transformer = SoundTransformer(
+    vocab_size=VOCAB_PER_CB,
+    n_codebooks=N_CODEBOOKS,
+    embed_dim=EMBED_DIM,
+    num_heads=2,
+    num_layers=2,
+    max_seq_len=MAX_TOKENS
+).to(DEVICE)
+transformer.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE), strict=True)
+transformer.eval()
 
-model = SoundTransformer(VOCAB_PER_CB, N_CODEBOOKS, EMB,
-                         num_heads=4, num_layers=3,
-                         max_seq_len=MAX_TOKENS).to(device).eval()
-model.load_state_dict(torch.load(CKPT, map_location=device), strict=True)
+# 🪄 Use a longer prefix from the reference sequence instead of BOS only
+PREFIX_LEN = 128  # or 512, depending on how much context you want
+SEQ = 128
+prefix = tokens2d[:PREFIX_LEN].unsqueeze(0).to(DEVICE)  # shape [1, P]
+gen = prefix.clone()  # will grow during generation
+pos_idx = PREFIX_LEN  # ⬅️ start from here
 
-with torch.no_grad():
-    lyr_emb = txt_enc.encode(LYRICS).to(device)
-
-BOS, SEQ = ref[0].item(), min(len(ref), MAX_TOKENS)
-print(f"🎯  generating {SEQ} tokens (incl. BOS)")
-
-gen = torch.tensor([[BOS]], device=device)
-past_kv = None
-pos_idx = 0
-cache_len = 0
 
 print("🎼  generating …")
 with torch.inference_mode():
-    for _ in range(SEQ - 1):
-        print("predicting",_)
-        logits, past_kv = model(
-            lyr_emb,
-            gen[:, -1:],
-            past_kv=past_kv,
-            use_cache=True,
-            step=pos_idx
-        )
-        nxt = logits[:, -1].argmax(-1, keepdim=True)
+    for _ in range(SEQ):
+        print("predicting", _)
+        logits = transformer(lyrics_embed, gen)
+        last_token_logits = logits[:, -1]
+        # For each channel, get the next token by selecting the argmax across vocab_size
+        next_tokens = []
+        for c in range(N_CODEBOOKS):  # Loop over channels (codebooks)
+            next_token_c = last_token_logits[:, c, :].argmax(-1, keepdim=True)  # Shape: [B, 1]
+            next_tokens.append(next_token_c)
+        
+        nxt = torch.cat(next_tokens, dim=1).unsqueeze(0)
         gen = torch.cat([gen, nxt], 1)
         pos_idx += 1
-        cache_len += 1
-        if cache_len > WINDOW:
-            cache_len = WINDOW
-            for i, (k, v) in enumerate(past_kv):
-                past_kv[i] = (k[:, -WINDOW:], v[:, -WINDOW:])
 
 tokens = gen.squeeze(0).cpu()
-rem = tokens.numel() % N_CODEBOOKS
-if rem: tokens = tokens[:-rem]
-
-tokens2d = (tokens.view(-1, N_CODEBOOKS)) % VOCAB_PER_CB  # remove offset
 print("🔊  decoding …")
-wave = aud_enc.decode(tokens2d)
-sr = aud_enc.sample_rate
+wave = audio_encoder.decode(tokens)
+sr = audio_encoder.sample_rate
 
 out = Path("reconstructed2.wav")
 torchaudio.save(out.as_posix(), wave, sr)
 print(f"✅  saved {out.resolve()}")
 
-acc = (tokens[:SEQ] == ref[:SEQ]).float().mean()
+acc = (tokens[:PREFIX_LEN + SEQ] == tokens2d[:PREFIX_LEN + SEQ]).float().mean()
 print(f"📊  accuracy vs reference: {acc * 100:.2f}%")

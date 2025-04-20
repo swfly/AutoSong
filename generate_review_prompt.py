@@ -31,6 +31,8 @@ def generate_prompt(base_dir):
         prompt_parts.append("\n# ⚠️ No Python files found in the project.\n")
     else:
         for rel_path, full_path in py_files:
+            if 'tests' in rel_path:
+                continue
             prompt_parts.append(f"\n# 📄 {rel_path}\n")
             prompt_parts.append("```python\n")
             prompt_parts.append(read_file(full_path))

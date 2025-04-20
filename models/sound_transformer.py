@@ -1,29 +1,11 @@
-"""
-SoundTransformer  –  decoder‑only GPT that now cross‑attends over the *entire*
-lyrics sequence instead of a single vector.
-"""
-
 import torch
 import torch.nn as nn
 
-
-class CachingDecoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
         super().__init__()
-        # causal self‑attention
-        self.self_attn = nn.MultiheadAttention(
-            d_model,
-            nhead,
-            dropout=dropout,
-            batch_first=True,
-        )
-        # cross‑attention over lyrics
-        self.cross_attn = nn.MultiheadAttention(
-            d_model,
-            nhead,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
@@ -35,45 +17,35 @@ class CachingDecoderLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         self.drop  = nn.Dropout(dropout)
 
-    # --------------------------- forward --------------------------- #
-    def forward(
-        self,
-        x: torch.Tensor,             # [B, S_new, D]
-        memory: torch.Tensor,        # [B, S_text, D]
-        past_kv=None,
-        *,
-        use_cache: bool = False,
-    ):
-        # ── causal self‑attention ── #
+    def generate_causal_mask(self, q_len, k_len):
+        return torch.tril(torch.ones(q_len, k_len, dtype=torch.bool))
+
+    def forward(self, x: torch.Tensor, memory: torch.Tensor, past_kv=None, *, use_cache: bool = False):
+        # Causal self-attention
         q = k = v = x
         if past_kv is not None:
             pk, pv = past_kv
             k = torch.cat([pk, k], 1)
             v = torch.cat([pv, v], 1)
 
-        attn_out, _ = self.self_attn(q, k, v, need_weights=False, is_causal=False)
+        mask = self.generate_causal_mask(q.size(1), k.size(1)).to(x.device)
+        attn_out, _ = self.self_attn(q, k, v, need_weights=False, is_causal=True, attn_mask = mask)
         x = self.norm1(x + self.drop(attn_out))
 
-        # ── cross‑attention over lyrics ── #
-        ca_out, _ = self.cross_attn(
-            x, memory, memory, need_weights=False
-        )
+        # Cross-attention over lyrics
+        ca_out, _ = self.cross_attn(x, memory, memory, need_weights=False)
         x = self.norm2(x + self.drop(ca_out))
 
-        # ── MLP ── #
+        # MLP
         x = self.norm3(x + self.drop(self.mlp(x)))
-
-        if use_cache:
-            return x, (k.detach(), v.detach())
-
         return x, None
 
 
 class SoundTransformer(nn.Module):
     def __init__(
         self,
-        vocab_size_per_cb: int,
-        n_codebooks: int,
+        vocab_size: int,        # vocab size per channel (single codebook)
+        n_codebooks: int,       # number of codebooks (channels)
         embed_dim: int = 768,
         num_layers: int = 8,
         num_heads: int = 8,
@@ -81,37 +53,36 @@ class SoundTransformer(nn.Module):
         max_seq_len: int = 2048,
     ):
         """
-        Args
+        Args:
         ----
-        vocab_size_per_cb : EnCodec vocab size for one codebook.
-        n_codebooks       : number of EnCodec codebooks concatenated.
+        vocab_size : The vocab size for a single codebook.
+        n_codebooks: The number of codebooks (channels).
         """
         super().__init__()
-        self.vocab_size_per_cb = vocab_size_per_cb
-        self.n_codebooks       = n_codebooks
+        self.vocab_size = vocab_size
+        self.n_codebooks = n_codebooks
 
-        # token‑type + position embeddings
-        self.token_emb = nn.Embedding(vocab_size_per_cb * n_codebooks, embed_dim)
-        self.cb_emb    = nn.Embedding(n_codebooks, embed_dim)
-        self.pos_emb   = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))
+        # Embedding layers
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)  # Embedding for token IDs
+        self.channel_emb = nn.Embedding(n_codebooks, embed_dim)  # Embedding for channels
+        self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))  # Positional embeddings
 
-        # lyrics projection (matches embed_dim)
+        # Lyrics projection (matches embed_dim)
         self.lyrics_proj = nn.Linear(embed_dim, embed_dim)
 
-        # stack of decoder layers
+        # Stack of decoder layers
         self.layers = nn.ModuleList(
-            CachingDecoderLayer(embed_dim, num_heads, dropout)
+            DecoderLayer(embed_dim, num_heads, dropout)
             for _ in range(num_layers)
         )
 
-        self.out_proj    = nn.Linear(embed_dim, vocab_size_per_cb * n_codebooks)
+        self.out_proj = nn.Linear(embed_dim, vocab_size)  # Per-channel output projection
         self.max_seq_len = max_seq_len
 
-    # --------------------------- forward --------------------------- #
     def forward(
         self,
         lyrics_embed: torch.Tensor,  # [B, S_text, D]  (full sequence)
-        token_ids: torch.Tensor,     # [B, S_new]
+        token_ids: torch.Tensor,     # [B, S, C], multi-channel input
         *,
         past_kv=None,
         use_cache: bool = False,
@@ -121,31 +92,39 @@ class SoundTransformer(nn.Module):
         Args
         ----
         lyrics_embed : full‑sequence embeddings from TextEncoder.encode(...)
-        token_ids    : newly fed audio tokens
+        token_ids    : newly fed multi-channel audio tokens
         step         : starting position offset for pos_emb (needed when
                        generating incrementally with cache)
         """
-        B, S_new = token_ids.shape
+        B, S_new, C = token_ids.shape  # Shape: [Batch, Sequence Length, Channels]
 
         # --- token/CB + position embeddings ------------------------ #
-        cb_idx = token_ids // self.vocab_size_per_cb
-        x = (
-            self.token_emb(token_ids)
-            + self.cb_emb(cb_idx)
-            + self.pos_emb[:, step : step + S_new]
-        )
+        # Token embedding per channel
+        x = self.token_emb(token_ids.reshape(-1))  # Flatten the token_ids to [B * S * C]
+        x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
+
+        # Channel embedding + position embedding
+        channel_emb = self.channel_emb(torch.arange(C, device=token_ids.device))  # [C, embed_dim]
+        channel_emb = channel_emb.unsqueeze(0).unsqueeze(0)  # Shape [1, 1, C, embed_dim]
+
+        pos_emb = self.pos_emb[:, step : step + S_new]  # [1, S_new, embed_dim]
+        pos_emb = pos_emb.unsqueeze(2)  # Add channel dimension -> [1, S_new, C, embed_dim]
+
+        x = x + channel_emb + pos_emb  # Adding token, channel, and position embeddings
 
         # --- projected lyric memory  ------------------------------- #
-        # shape stays  [B, S_text, D]
-        memory = self.lyrics_proj(lyrics_embed)
+        memory = self.lyrics_proj(lyrics_embed)  # [B, S_text, embed_dim]
 
         # --- transformer layers ------------------------------------ #
         new_cache = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             pkv = None if past_kv is None else past_kv[i]
-            x, kv = layer(x, memory, pkv, use_cache=use_cache)
+            x, kv = layer(x.view(B, S_new * C, -1), memory, pkv, use_cache=use_cache)  # Flatten [B, S_new * C, embed_dim]
+            x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
             if use_cache:
                 new_cache.append(kv)
 
-        logits = self.out_proj(x)  # [B, S_new, vocab]
+        # --- Final output projection ------------------------------ #
+        logits = self.out_proj(x.view(B, S_new * C, -1))  # [B, S_new * C, vocab_size]
+        logits = logits.view(B, S_new, C, self.vocab_size)  # Reshape to [B, S_new, C, vocab_size]
         return (logits, new_cache) if use_cache else logits

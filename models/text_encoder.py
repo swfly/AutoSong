@@ -16,7 +16,7 @@ import torch
 class TextEncoder(nn.Module):
     def __init__(
         self,
-        model_name: str = "bert-base-uncased",
+        model_name: str = "hfl/chinese-roberta-wwm-ext",
         out_dim: int = 512,
         max_tokens: int = 256,
     ):

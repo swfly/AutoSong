@@ -10,7 +10,18 @@ class AudioEncoder:
         self.model.set_target_bandwidth(bandwidth)
         self.model.eval().to(self.device)
         self.sample_rate = sample_rate
-        self.channels = self.model.channels
+        self.channels = self.model.channels  # Number of codebooks (quantizers)
+        
+        # Access the codebook and determine the vocabulary size
+        try:
+            # Iterate over each vector quantization layer in the quantizer
+            quantizer = self.model.quantizer.vq
+            first_codebook = quantizer.layers[0]._codebook  # Assuming all codebooks have the same size
+            
+            # The vocabulary size is the first dimension of the codebook
+            self.vocab_size = first_codebook.codebook_size  # This gives the number of quantization vectors
+        except Exception as e:
+            self.vocab_size = None
 
     def encode(self, wav_path: str) -> torch.Tensor:
         """
@@ -41,5 +52,4 @@ class AudioEncoder:
         with torch.no_grad():
             audio = self.model.decode(encoded_frames)              # (1, C, T)
 
-        return audio.squeeze(0).cpu()    
-
+        return audio.squeeze(0).cpu()
