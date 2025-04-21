@@ -46,12 +46,23 @@ def load_random_song(segment_tokens: int):
 
     if len(tok) > segment_tokens:
         start = random.randint(0, len(tok) - segment_tokens - 1)
-        tok = tok[start:start + segment_tokens + 1]
+        tok = tok[start:start + segment_tokens]
         
 
     inp = tok.unsqueeze(0).to(device)  # (1, 18k)
 
     return lyr_emb.detach(), inp.detach()
+def load_batch(batch_size: int, segment_tokens: int):
+    lyrics_list = []
+    tokens_list = []
+    for _ in range(batch_size):
+        lyr, tok = load_random_song(segment_tokens)
+        lyrics_list.append(lyr)
+        tokens_list.append(tok)
+
+    lyrics = torch.cat(lyrics_list, dim=0)    # [B, S_text, D]
+    tokens = torch.cat(tokens_list, dim=0)      # [B, S, C]
+    return lyrics, tokens
 
 # ───────────────────────── config ───────────────────────── #
 
@@ -61,13 +72,13 @@ device = (torch.device("cuda") if torch.cuda.is_available()
 CHECKPOINT_PATH = "checkpoints/train_dataset.pt"
 DEVICE = device
 
-text_encoder = TextEncoder().to(torch.device("cpu"))
+text_encoder = TextEncoder(max_tokens=512).to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
-EMBED_DIM = 512
+EMBED_DIM = 1024
 MAX_TOKENS = 18000
 EPOCHS = 1000
-LR = 1e-4
+LR = 5e-5
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 
@@ -75,8 +86,8 @@ transformer = SoundTransformer(
     vocab_size=VOCAB_PER_CB,
     n_codebooks=N_CODEBOOKS,
     embed_dim=EMBED_DIM,
-    num_heads=2,
-    num_layers=3,
+    num_heads=4,
+    num_layers=8,
     max_seq_len=MAX_TOKENS
 ).to(DEVICE)
 
@@ -109,9 +120,9 @@ os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
 for epoch in range(1, EPOCHS + 1):
     transformer.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     segment_tokens = get_segment_tokens(epoch)
-    lyr, x = load_random_song(segment_tokens)
+    lyr, x = load_batch(4, segment_tokens)
     
     logits = transformer(lyr, x)  # [B, S, C, V]
 
@@ -119,11 +130,8 @@ for epoch in range(1, EPOCHS + 1):
     logits = logits[:, :-1, :, :]    # [B, S-1, C, V]
     targets = x[:, 1:, :]            # [B, S-1, C]
 
-    # Reshape to flatten everything:
-    # logits_flat: [B * (S-1) * C, V]
-    # targets_flat: [B * (S-1) * C]
-    logits_flat = logits.reshape(-1, VOCAB_PER_CB)
-    targets_flat = targets.reshape(-1)
+    logits_flat = logits.contiguous().view(-1, VOCAB_PER_CB)
+    targets_flat = targets.contiguous().view(-1)
 
     # Compute total cross-entropy loss in parallel
     total_loss = criterion(logits_flat, targets_flat)

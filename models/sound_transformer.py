@@ -17,10 +17,8 @@ class DecoderLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         self.drop  = nn.Dropout(dropout)
 
-    def generate_causal_mask(self, q_len, k_len):
-        return torch.tril(torch.ones(q_len, k_len, dtype=torch.bool))
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor, past_kv=None, *, use_cache: bool = False):
+    def forward(self, x, memory, attn_mask=None, past_kv=None, *, use_cache=False):
         # Causal self-attention
         q = k = v = x
         if past_kv is not None:
@@ -28,8 +26,7 @@ class DecoderLayer(nn.Module):
             k = torch.cat([pk, k], 1)
             v = torch.cat([pv, v], 1)
 
-        mask = self.generate_causal_mask(q.size(1), k.size(1)).to(x.device)
-        attn_out, _ = self.self_attn(q, k, v, need_weights=False, is_causal=True, attn_mask = mask)
+        attn_out, _ = self.self_attn(q, k, v, need_weights=False, is_causal=True, attn_mask = attn_mask)
         x = self.norm1(x + self.drop(attn_out))
 
         # Cross-attention over lyrics
@@ -78,8 +75,14 @@ class SoundTransformer(nn.Module):
         )
 
         self.out_proj = nn.Linear(embed_dim, vocab_size)  # Per-channel output projection
+        
+        # caches
         self.max_seq_len = max_seq_len
-
+        self.register_buffer("channel_ids", torch.arange(n_codebooks))
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.full((max_seq_len, max_seq_len), float("-inf")), diagonal=1)
+        )
     def forward(
         self,
         lyrics_embed: torch.Tensor,  # [B, S_text, D]  (full sequence)
@@ -105,7 +108,7 @@ class SoundTransformer(nn.Module):
         x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
 
         # Channel embedding + position embedding
-        channel_emb = self.channel_emb(torch.arange(C, device=token_ids.device))  # [C, embed_dim]
+        channel_emb = self.channel_emb(self.channel_ids)
         channel_emb = channel_emb.unsqueeze(0).unsqueeze(0)  # Shape [1, 1, C, embed_dim]
 
         pos_emb = self.pos_emb[:, step : step + S_new]  # [1, S_new, embed_dim]
@@ -121,7 +124,10 @@ class SoundTransformer(nn.Module):
         new_cache = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             pkv = None if past_kv is None else past_kv[i]
-            x, kv = layer(x.view(B, S_new * C, -1), memory, pkv, use_cache=use_cache)  # Flatten [B, S_new * C, embed_dim]
+            flat_x = x.view(B, S_new * C, -1)
+            seq_len = flat_x.size(1)
+            mask = self.causal_mask[:seq_len, :seq_len].to(flat_x.device, flat_x.dtype)
+            x, kv = layer(flat_x, memory, attn_mask=mask, past_kv=pkv, use_cache=use_cache)
             x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
             if use_cache:
                 new_cache.append(kv)

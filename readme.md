@@ -216,8 +216,3 @@ dataset/
 ```
 
 - Each subdirectory is a sample
-- Each must contain:
-  - A `.txt` file with the lyrics (UTF-8 plain text)
-  - A `.mp3` or `.flac` audio file
-
-> ⚠️ Audio files are resampled to 24 kHz and tokenized using Meta’s EnCodec (24 kHz model).
