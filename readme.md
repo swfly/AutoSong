@@ -7,46 +7,7 @@ This project aims to explore whether a **GPT-style autoregressive transformer** 
 The system predicts audio **block-by-block** (e.g., using EnCodec tokens), using the **textual prompt as context** and previously generated audio blocks to model temporal coherence.
 
 In order to fully leverage the creativity of transformer, the lyrics is always provided in complete as memory prompt: it lets transformer to decide about the timing and structure of the song.
-```
-            +----------------------+
-            | User: Lyrics + Genre |
-            +----------------------+
-                       |
-                       v
-                +--------------+
-                | TextEncoder  |
-                +--------------+
-                       |
-                       v
-             +-------------------+
-             | Lyrics Embedding  |
-             +-------------------+
-                       |
-                       v
-   +-------------------------------------+
-   |         SoundTransformer           |
-   | (autoregressive decoder-only model) |
-   +-------------------------------------+
-        ^                    |
-        |                    v
-        |       +-----------------------+
-        |       | Audio Tokenization    |
-        |       |    (AudioEncoder)     |
-        |       +-----------------------+
-        |                    |
-        |                    v
-        +<---- Generated Tokens (1D) ----+
-                       |
-                       v
-                +--------------+
-                | AudioDecoder |  ← (same model)
-                +--------------+
-                       |
-                       v
-               +----------------+
-               |   Output WAV   |
-               +----------------+
-```
+
 ---
 
 ## 🎯 Goal of Initial Prototype
@@ -67,23 +28,113 @@ The overfit test passed: it can generate a complete song with the network.
 
 Now can actually "learn" multi-channel generating.
 
+
+## Data Flow
+
+- Text encoder generates lyric tokens.
+- AudioEncoder generates a **complete** sequence of sound tokens using Meta's EnCodec.
+- Transformer takes Text as "memory" and predicts n+1-th sound token using previous n sound tokens: the naive autoregression style.
+```
+          ┌────────────────────┐
+          │  User Input        │
+          │  Lyrics + Genre    │
+          └────────┬───────────┘
+                   │
+                   ▼
+         ┌──────────────────────┐
+         │ BERT Text Encoder    │
+         │ (frozen, token-level │
+         │  hidden states)      │
+         └────────┬─────────────┘
+                  │
+       token-level embeddings ∈ ℝ^{T × d_bert}
+                  │
+                  ▼
+      ┌─────────────────────────────┐
+      │ Linear Projection to d_model│
+      └────────┬────────────────────┘
+               │
+   memory prompt M ∈ ℝ^{T × d_model}
+               │
+               ▼
+    ┌─────────────────────────────────────┐
+    │     SoundTransformer (decoder)      │
+    │                                     │
+    │ ┌───────────────────────────────┐   │
+    │ │  Step 1: Embed Audio Tokens   │   │
+    │ │                               │   │
+    │ │  token_id → token_emb ∈ ℝ^d   │   │
+    │ │  codebook_id → cb_emb ∈ ℝ^d   │   │
+    │ │  position_id → pos_emb ∈ ℝ^d  │   │
+    │ └────────────┬──────────────────┘   │
+    │              │                      │
+    │              ▼                      │
+    │      summed embedding x ∈ ℝ^{T × d} │
+    │              │                      │
+    │              ▼                      │
+    │  ┌─────────────────────────────┐    │
+    │  │  Transformer Decoder Layers │    │
+    │  │                             │    │
+    │  │ - Causal Self-Attention     │    │
+    │  │ - Cross-Attn to M           │◄───┼─ memory from lyrics
+    │  │ - MLP + LayerNorms          │    │
+    │  └────────┬────────────────────┘    │
+    │           │                         │
+    │           ▼                         │
+    │     projected logits ∈ ℝ^{T × C × V}
+    └───────────┬─────────────────────────┘
+                │
+                ▼
+    ┌────────────────────────────────────┐
+    │  Predicted Audio Tokens (1D, C)    │
+    └───────────┬────────────────────────┘
+                │
+                ▼
+    ┌────────────────────────────────────┐
+    │     EnCodec Audio Decoder          │
+    │     (Meta EnCodec, pretrained)     │
+    └───────────┬────────────────────────┘
+                │
+                ▼
+         ┌─────────────────────┐
+         │     Output WAV      │
+         └─────────────────────┘
+
+```
+
 ## 🧮 Transformer Mechanics – Mathematical Summary
 
 This section explains the internal mechanics of the SoundTransformer using mathematical notation.
 
 ### 🔸 Input Embeddings
 
-Each token in the flattened audio sequence is embedded as:
+Each audio input is a sequence of discrete tokens from multiple codebooks (channels), represented as a tensor of shape \( [B, T, C] \), where:
+
+- \( B \) is the batch size
+- \( T \) is the number of time steps
+- \( C \) is the number of codebooks (channels)
+
+For each token at time \( t \) and channel \( c \), its embedding is computed as:
 
 $$
-\mathbf{e}_i = \text{token\_emb}(t_i) + \text{cb\_emb}(c_i) + \text{pos\_emb}(i)
+\mathbf{e}_{t, c} = \text{token\_emb}(x_{t, c}) + \text{channel\_emb}(c) + \text{pos\_emb}(t)
 $$
 
 Where:
-- \( t_i \) is the token index (e.g., 0–8191)
-- \( c_i = \left\lfloor \frac{t_i}{V} \right\rfloor \) is the codebook index (with \( V \) = vocab size per codebook)
-- \( i \) is the absolute position
-- All embedding vectors lie in \( \mathbb{R}^d \)
+
+- \( x_{t, c} \in \{0, \dots, V - 1\} \) is the token ID at timestep \( t \), channel \( c \)
+- \( \text{token\_emb} \in \mathbb{R}^{V \times d} \) is the shared embedding lookup table for token IDs
+- \( \text{channel\_emb}(c) \in \mathbb{R}^d \) is a learned embedding for the codebook index \( c \)
+- \( \text{pos\_emb}(t) \in \mathbb{R}^d \) is a learned positional embedding for time \( t \)
+- All embeddings are in \( \mathbb{R}^d \), the transformer model dimension
+
+The embeddings are computed and summed **per token per channel**, then reshaped to a flattened sequence \( [B, T \cdot C, d] \) before being processed by the decoder stack.
+
+This multi-channel embedding formulation preserves:
+- **Temporal ordering** across time steps (via positional embeddings)
+- **Semantic separation** across codebooks (via channel embeddings)
+- **Discrete token identity** (via token embeddings)
+
 
 ---
 
@@ -95,13 +146,6 @@ $$
 \mathbf{L} = \text{BERT}(\text{lyrics}) \in \mathbb{R}^{T_{\text{lyr}} \times d'}
 $$
 
-Then projected to match the transformer’s embedding size:
-
-$$
-\mathbf{M} = \mathbf{L} \cdot \mathbf{W}_{\text{proj}} \in \mathbb{R}^{T_{\text{lyr}} \times d}
-$$
-
-This becomes the **memory** used in cross-attention.
 
 ---
 
@@ -121,6 +165,13 @@ $$
 
 #### 2. Cross-Attention over Lyrics (Memory)
 
+The lyrics embedding is first projected to match the transformer’s embedding size:
+
+$$
+\mathbf{M} = \mathbf{L} \cdot \mathbf{W}_{\text{proj}} \in \mathbb{R}^{T_{\text{lyr}} \times d}
+$$
+
+This becomes the **memory** (M) used in cross-attention.
 $$
 Q = XW_Q^{\text{(cross)}}, \quad K = MW_K^{\text{(cross)}}, \quad V = MW_V^{\text{(cross)}}
 $$
@@ -128,8 +179,6 @@ $$
 $$
 \text{CrossAttn}(Q, K, V) = \text{softmax}\left( \frac{QK^\top}{\sqrt{d}} \right)V
 $$
-
-Here, \( M \) is the lyric embedding sequence, and each audio token dynamically attends to relevant lyric tokens.
 
 ---
 
@@ -168,12 +217,6 @@ To enable this, the system is trained on entire song spans (up to 18,000 EnCodec
 - Allows lyric-conditioned guidance across full sections of a song
 
 While this demands significantly more VRAM and compute than local models, it is essential to the goal of coherent music generation from start to finish.
-
-## Data Flow
-
-- Text encoder generates lyric tokens.
-- AudioEncoder generates a **complete** sequence of sound tokens using Meta's EnCodec.
-- Transformer takes Text as "memory" and predicts n+1-th sound token using previous n sound tokens.
 
 
 ## 🧪 Formal Full-Context Training
