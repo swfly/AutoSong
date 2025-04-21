@@ -18,13 +18,13 @@ device = (torch.device("cuda") if torch.cuda.is_available()
 CHECKPOINT_PATH = "checkpoints/train_dataset.pt"
 DEVICE = device
 
-text_encoder = TextEncoder().to(torch.device("cpu"))
+text_encoder = TextEncoder(max_tokens=512).to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
-EMBED_DIM = 512
+EMBED_DIM = 1024
 MAX_TOKENS = 18000
 EPOCHS = 1000
-LR = 1e-4
+LR = 5e-5
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 
@@ -32,8 +32,8 @@ transformer = SoundTransformer(
     vocab_size=VOCAB_PER_CB,
     n_codebooks=N_CODEBOOKS,
     embed_dim=EMBED_DIM,
-    num_heads=2,
-    num_layers=3,
+    num_heads=4,
+    num_layers=8,
     max_seq_len=MAX_TOKENS
 ).to(DEVICE)
 
@@ -53,14 +53,15 @@ else:
 
 
 # ───────────────────────── generate ───────────────────────── #
-with open("dataset/song_001/song_001.txt", encoding="utf-8") as f:
-    lyrics = f.read()
+lyrics = "明天你好\n在一片蓝色月光下"
+# with open("dataset/song_001/song_001.txt", encoding="utf-8") as f:
+#     lyrics = f.read()
 with torch.no_grad():
     lyr_emb = text_encoder.encode(lyrics).to(device)
-
+print(lyr_emb)
 # 🪄 Use a longer prefix from the reference sequence instead of BOS only
-PREFIX_LEN = 128  # or 512, depending on how much context you want
-SEQ = 768
+PREFIX_LEN = 32  # or 512, depending on how much context you want
+SEQ = 1024
 prefix = tokens2d[:PREFIX_LEN].unsqueeze(0).to(DEVICE)  # shape [1, P]
 gen = prefix.clone()  # will grow during generation
 pos_idx = PREFIX_LEN  # ⬅️ start from here

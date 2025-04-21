@@ -15,7 +15,7 @@ from models.sound_transformer import SoundTransformer
 # ──────────────────── helper: load one song ──────────────────── #
 DATASET_DIR   = "dataset"
 def get_segment_tokens(step, total_steps=10_000, min_len=200, max_len=18_000):
-    return 1024
+    return 2048
     """Smooth nonlinear segment schedule from 200 to 18k over 10k steps."""
     # Logistic growth curve parameters
     s0 = 4000           # inflection point (shift right if you want slower growth)
@@ -45,7 +45,7 @@ def load_random_song(segment_tokens: int):
     tok = audio_encoder.encode(os.path.join(path, audio))          # (T, C) on CPU
 
     if len(tok) > segment_tokens:
-        start = random.randint(0, len(tok) - segment_tokens - 1)
+        start = 0  #random.randint(0, len(tok) - segment_tokens - 1)
         tok = tok[start:start + segment_tokens]
         
 
@@ -78,7 +78,7 @@ VOCAB_PER_CB = audio_encoder.vocab_size
 EMBED_DIM = 1024
 MAX_TOKENS = 18000
 EPOCHS = 1000
-LR = 5e-5
+LR = 1e-4
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 

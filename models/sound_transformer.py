@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn
-import vocabulary
+
+import os, sys, random, gc
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import models.vocabulary
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
@@ -60,7 +64,7 @@ class SoundTransformer(nn.Module):
         self.vocab_size = vocab_size
         self.n_codebooks = n_codebooks
         
-        self.vocab = vocabulary.generate_pinyin_vocab() + ["<PAD>", "<UNK>"]
+        self.vocab = models.vocabulary.generate_pinyin_vocab() + ["<PAD>", "<UNK>"]
         # Embedding layers
         self.token_emb = nn.Embedding(vocab_size, embed_dim)  # Embedding for token IDs
         self.channel_emb = nn.Embedding(n_codebooks, embed_dim)  # Embedding for channels
@@ -68,8 +72,7 @@ class SoundTransformer(nn.Module):
         self.phoneme_emb = nn.Embedding(num_embeddings=len(self.vocab), embedding_dim=embed_dim)
 
         # Lyrics projection (matches embed_dim)
-        # 768 is the dimensionality of a bert token
-        self.lyrics_proj = nn.Linear(768, embed_dim)
+        self.lyrics_proj = nn.Linear(embed_dim, embed_dim)
 
         # Stack of decoder layers
         self.layers = nn.ModuleList(
@@ -124,7 +127,7 @@ class SoundTransformer(nn.Module):
         x = x + channel_emb + pos_emb  # Adding token, channel, and position embeddings
 
         # --- projected lyric memory  ------------------------------- #
-
+        
         memory = self.lyrics_proj(lyrics_embed)  # [B, S_text, embed_dim]
 
         # --- transformer layers ------------------------------------ #
