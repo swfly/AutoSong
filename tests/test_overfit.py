@@ -70,22 +70,20 @@ for epoch in range(1, EPOCHS + 1):
     transformer.train()
     optimizer.zero_grad()
 
-    logits = transformer(lyrics_embed, input_tokens2d)
-    # Initialize total loss
-    total_loss = 0
-    # Loop over each channel (C) to calculate the loss separately per channel
-    for c in range(N_CODEBOOKS):
-        # Get the logits for the current channel: [B, S, vocab_size]
-        channel_logits = logits[:, :, c, :]
-        channel_target = input_tokens2d[:, 1:, c]
-        channel_logits_flat = channel_logits[:, :-1, :].view(-1, VOCAB_PER_CB)  # [B * (S-1), vocab_size]
-        channel_target_flat = channel_target.view(-1)  # [B * (S-1)]
-        # Calculate the loss for this channel, compare to NEXT token
-        channel_loss = criterion(channel_logits_flat, channel_target_flat)
+    logits = transformer(lyrics_embed, input_tokens2d)  # [B, S, C, V]
 
-        # Add it to the total loss
-        total_loss += channel_loss
-    total_loss /= N_CODEBOOKS
+    # Predicting next token: logits[:, :-1], targets[:, 1:]
+    logits = logits[:, :-1, :, :]    # [B, S-1, C, V]
+    targets = input_tokens2d[:, 1:, :]            # [B, S-1, C]
+
+    # Reshape to flatten everything:
+    # logits_flat: [B * (S-1) * C, V]
+    # targets_flat: [B * (S-1) * C]
+    logits_flat = logits.reshape(-1, VOCAB_PER_CB)
+    targets_flat = targets.reshape(-1)
+
+    # Compute total cross-entropy loss in parallel
+    total_loss = criterion(logits_flat, targets_flat)
     total_loss.backward()
     optimizer.step()
 

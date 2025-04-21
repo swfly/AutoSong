@@ -68,7 +68,8 @@ class SoundTransformer(nn.Module):
         self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))  # Positional embeddings
 
         # Lyrics projection (matches embed_dim)
-        self.lyrics_proj = nn.Linear(embed_dim, embed_dim)
+        # 768 is the dimensionality of a bert token
+        self.lyrics_proj = nn.Linear(768, embed_dim)
 
         # Stack of decoder layers
         self.layers = nn.ModuleList(
@@ -113,6 +114,7 @@ class SoundTransformer(nn.Module):
         x = x + channel_emb + pos_emb  # Adding token, channel, and position embeddings
 
         # --- projected lyric memory  ------------------------------- #
+
         memory = self.lyrics_proj(lyrics_embed)  # [B, S_text, embed_dim]
 
         # --- transformer layers ------------------------------------ #

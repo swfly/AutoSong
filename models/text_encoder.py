@@ -31,7 +31,6 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.tokenizer = BertTokenizer.from_pretrained(model_name)
         self.bert      = BertModel.from_pretrained(model_name)
-        self.proj      = nn.Linear(self.bert.config.hidden_size, out_dim)
         self.max_tokens = max_tokens
 
     # ───────────────────────── public API ───────────────────────── #
@@ -60,9 +59,7 @@ class TextEncoder(nn.Module):
             toks = {k: v.to(device) for k, v in toks.items()}
 
         outs = self.bert(**toks).last_hidden_state  # [1, T, hidden]
-        seq_emb = self.proj(outs)                   # [1, T, out_dim]
-        return seq_emb  # already detached by inference_mode
-
+        return outs
     # Convenience helpers — unchanged behaviour
     def tokenize(self, text: str) -> torch.Tensor:
         return self.tokenizer.encode(text, return_tensors="pt", truncation=True)

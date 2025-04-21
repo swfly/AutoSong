@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 # Curriculum Learning: starting from small size segments 
 # and gradually increase to full length
 
@@ -8,7 +6,6 @@ import os, sys, random, gc
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch, torch.nn as nn, torch.optim as optim
-from tqdm import tqdm
 
 from models.text_encoder     import TextEncoder
 from models.audio_encoder    import AudioEncoder
@@ -18,7 +15,7 @@ from models.sound_transformer import SoundTransformer
 # ──────────────────── helper: load one song ──────────────────── #
 DATASET_DIR   = "dataset"
 def get_segment_tokens(step, total_steps=10_000, min_len=200, max_len=18_000):
-    return 8192
+    return 1024
     """Smooth nonlinear segment schedule from 200 to 18k over 10k steps."""
     # Logistic growth curve parameters
     s0 = 4000           # inflection point (shift right if you want slower growth)
@@ -64,14 +61,13 @@ device = (torch.device("cuda") if torch.cuda.is_available()
 CHECKPOINT_PATH = "checkpoints/train_dataset.pt"
 DEVICE = device
 
-text_encoder = TextEncoder().to(torch.device("cpu") if DEVICE.type == "mps" else DEVICE)
+text_encoder = TextEncoder().to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
 EMBED_DIM = 512
 MAX_TOKENS = 18000
 EPOCHS = 1000
 LR = 1e-4
-
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 
@@ -85,11 +81,11 @@ transformer = SoundTransformer(
 ).to(DEVICE)
 
 
-
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(transformer.parameters(), lr=LR)
 
 
+# ───────────────────────── load ───────────────────────── #
 if os.path.exists(CHECKPOINT_PATH):
     print(f"🔁 Found checkpoint at {CHECKPOINT_PATH}, resuming training...")
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
@@ -107,6 +103,7 @@ if os.path.exists(CHECKPOINT_PATH):
 else:
     print("🆕 No checkpoint found, starting from scratch.")
 
+# ───────────────────────── train ───────────────────────── #
 print("Starting training …")
 os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
@@ -116,28 +113,26 @@ for epoch in range(1, EPOCHS + 1):
     segment_tokens = get_segment_tokens(epoch)
     lyr, x = load_random_song(segment_tokens)
     
-    logits = transformer(lyr, x)
-    # Initialize total loss
-    total_loss = 0
-    # Loop over each channel (C) to calculate the loss separately per channel
-    for c in range(N_CODEBOOKS):
-        # Get the logits for the current channel: [B, S, vocab_size]
-        channel_logits = logits[:, :, c, :]
-        channel_target = x[:, 1:, c]
-        channel_logits_flat = channel_logits[:, :-1, :].view(-1, VOCAB_PER_CB)  # [B * (S-1), vocab_size]
-        channel_target_flat = channel_target.view(-1)  # [B * (S-1)]
-        # Calculate the loss for this channel, compare to NEXT token
-        channel_loss = criterion(channel_logits_flat, channel_target_flat)
+    logits = transformer(lyr, x)  # [B, S, C, V]
 
-        # Add it to the total loss
-        total_loss += channel_loss
-    total_loss /= N_CODEBOOKS
+    # Predicting next token: logits[:, :-1], targets[:, 1:]
+    logits = logits[:, :-1, :, :]    # [B, S-1, C, V]
+    targets = x[:, 1:, :]            # [B, S-1, C]
+
+    # Reshape to flatten everything:
+    # logits_flat: [B * (S-1) * C, V]
+    # targets_flat: [B * (S-1) * C]
+    logits_flat = logits.reshape(-1, VOCAB_PER_CB)
+    targets_flat = targets.reshape(-1)
+
+    # Compute total cross-entropy loss in parallel
+    total_loss = criterion(logits_flat, targets_flat)
     total_loss.backward()
     optimizer.step()
 
 
     print(f"[Epoch {epoch}] Loss: {total_loss.item():.4f}")
-    del lyr, x, logits, total_loss, channel_logits, channel_target,channel_loss
+    del lyr, x, logits, total_loss
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -148,60 +143,3 @@ for epoch in range(1, EPOCHS + 1):
             "optimizer_state_dict": optimizer.state_dict(),
         }, CHECKPOINT_PATH)
         print(f"💾  saved checkpoint → {CHECKPOINT_PATH}")
-
-quit()
-# ───────────────────────── training ───────────────────────── #
-os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
-print(f"🚀 full‑context training (18 k tokens) – device: {device}")
-
-start_epoch = 1
-
-if os.path.exists(CKPT_PATH):
-    print(f"🔁 Found checkpoint at {CKPT_PATH}, resuming training...")
-    checkpoint = torch.load(CKPT_PATH, map_location=device)
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-    else:
-        model.load_state_dict(checkpoint)  # raw state_dict
-
-    if "optimizer_state_dict" in checkpoint and "epoch" in checkpoint:
-        # optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        # scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-    else:
-        print("⚠️ Checkpoint doesn't contain optimizer/scheduler state. Starting fresh for them.")
-else:
-    print("🆕 No checkpoint found, starting from scratch.")
-
-for epoch in range(1, EPOCHS + 1):
-    model.train()
-    segment_tokens = get_segment_tokens(epoch)
-    print('now training with length',segment_tokens)
-    lyr, x, y = load_random_song(segment_tokens)
-
-    optimizer.zero_grad(set_to_none=True)
-    logits = model(lyr, x)
-    loss = criterion(logits.view(-1, TOTAL_VOCAB), y.view(-1))
-    loss.backward()
-    optimizer.step()
-    scheduler.step()
-
-    # scalar before deleting tensors
-    loss_val = loss.item()
-    lr_val   = scheduler.get_last_lr()[0]
-
-    # explicit cleanup
-    del lyr, x, y, logits, loss
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    print(f"[{(start_epoch+epoch):03d}/{EPOCHS}] loss={loss_val:.4f}  lr={lr_val:.6f}")
-
-    if epoch % 10 == 0:
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-        }, CKPT_PATH)
-        print(f"💾  saved checkpoint → {CKPT_PATH}")

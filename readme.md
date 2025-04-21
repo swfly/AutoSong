@@ -65,12 +65,7 @@ The aim is to validate whether lyrics and genre can meaningfully guide music gen
 
 The overfit test passed: it can generate a complete song with the network.
 
-~~However, the real training with a variety of songs (5 of them) with known lyrics (chinese) doesn't work: it always generates blank audio.
-To see what's wrong here, I reduce the size to 8K (previously 18K) with bandwidth=3 to check if the quality of audio and the scope of learning matters.~~
-
-~~It now generates looping "la la la" sound with 8K context size.~~
-
-No, GPT-generated code is garbage. Need to re-do the network from scratch.
+Now can actually "learn" multi-channel generating.
 
 ## 🧮 Transformer Mechanics – Mathematical Summary
 
