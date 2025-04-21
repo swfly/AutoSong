@@ -6,9 +6,9 @@ This project aims to explore whether a **GPT-style autoregressive transformer** 
 
 The system predicts audio **block-by-block** (e.g., using EnCodec tokens), using the **textual prompt as context** and previously generated audio blocks to model temporal coherence.
 
-In order to fully leverage the creativity of transformer, the lyrics is always provided in complete as memory prompt: it lets transformer to decide about the timing and structure of the song.
+In order to fully leverage the creativity of transformer, the lyrics is always provided in complete as memory prompt: it lets transformer decide about the timing and structure of the song.
 
-This project also features AI-assisted development: I have no idea what a transformer is and I let AI did most of the work. While, I evetually learned all of them and corrected the code. Not a good experience.
+This project also features AI-assisted development: I have no idea what a transformer is, and I let AI do most of the work. While I eventually learned all of them and corrected the code. Not a good experience.
 
 ---
 
