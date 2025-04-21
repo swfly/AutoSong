@@ -1,4 +1,4 @@
-# 🎵 Lyric-to-Music Transformer – Project Notes
+# 🎵 AutoSong – Lyric‑Driven Autoregressive Composition
 
 ## 🧠 Purpose
 
