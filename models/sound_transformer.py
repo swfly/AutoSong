@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import vocabulary
 
 class DecoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
@@ -58,11 +59,13 @@ class SoundTransformer(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_codebooks = n_codebooks
-
+        
+        self.vocab = vocabulary.generate_pinyin_vocab() + ["<PAD>", "<UNK>"]
         # Embedding layers
         self.token_emb = nn.Embedding(vocab_size, embed_dim)  # Embedding for token IDs
         self.channel_emb = nn.Embedding(n_codebooks, embed_dim)  # Embedding for channels
         self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))  # Positional embeddings
+        self.phoneme_emb = nn.Embedding(num_embeddings=len(self.vocab), embedding_dim=embed_dim)
 
         # Lyrics projection (matches embed_dim)
         # 768 is the dimensionality of a bert token
@@ -85,7 +88,7 @@ class SoundTransformer(nn.Module):
         )
     def forward(
         self,
-        lyrics_embed: torch.Tensor,  # [B, S_text, D]  (full sequence)
+        lyrics: torch.Tensor,  # [B, S_text, D]  (full sequence)
         token_ids: torch.Tensor,     # [B, S, C], multi-channel input
         *,
         past_kv=None,
@@ -95,7 +98,7 @@ class SoundTransformer(nn.Module):
         """
         Args
         ----
-        lyrics_embed : full‑sequence embeddings from TextEncoder.encode(...)
+        lyrics : full‑sequence pinyin IDs from TextEncoder.encode(...)
         token_ids    : newly fed multi-channel audio tokens
         step         : starting position offset for pos_emb (needed when
                        generating incrementally with cache)
@@ -107,6 +110,10 @@ class SoundTransformer(nn.Module):
         x = self.token_emb(token_ids.reshape(-1))  # Flatten the token_ids to [B * S * C]
         x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
 
+        # Pinyin embedding + position embedding for lyrics
+        lyrics_embed = self.phoneme_emb(lyrics)         # [B, S_text, 512]
+        pos_lyrics = self.pos_emb[:, :lyrics_embed.size(1)]  # [1, S_lyrics, D]
+        lyrics_embed = lyrics_embed + pos_lyrics  # broadcast add over batch
         # Channel embedding + position embedding
         channel_emb = self.channel_emb(self.channel_ids)
         channel_emb = channel_emb.unsqueeze(0).unsqueeze(0)  # Shape [1, 1, C, embed_dim]
