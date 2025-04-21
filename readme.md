@@ -8,6 +8,8 @@ The system predicts audio **block-by-block** (e.g., using EnCodec tokens), using
 
 In order to fully leverage the creativity of transformer, the lyrics is always provided in complete as memory prompt: it lets transformer to decide about the timing and structure of the song.
 
+This project also features AI-assisted development: I have no idea what a transformer is and I let AI did most of the work. While, I evetually learned all of them and corrected the code. Not a good experience.
+
 ---
 
 ## 🎯 Goal of Initial Prototype
