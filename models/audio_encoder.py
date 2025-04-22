@@ -22,7 +22,14 @@ class AudioEncoder:
             self.vocab_size = first_codebook.codebook_size  # This gives the number of quantization vectors
         except Exception as e:
             self.vocab_size = None
-
+    def tokens_to_vectors(self, tokens: torch.LongTensor) -> torch.FloatTensor:
+        """
+        Map integer tokens ∈ [B, T, C] to their codebook vectors ∈ [B, T, C, D].
+        """
+        dev = tokens.device
+        cb_tables = [self.model.quantizer.vq.layers[c]._codebook.codebook.to(dev)
+                    for c in range(self.channels)]
+        return torch.stack([cb_tables[c][tokens[..., c]] for c in range(self.channels)], dim=2)
     def encode(self, wav_path: str) -> torch.Tensor:
         """
         Encode audio file into a sequence of quantized tokens.

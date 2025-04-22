@@ -85,13 +85,14 @@ DEVICE = device
 text_encoder = TextEncoder(max_tokens=512).to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
-CODE_DIM = audio_encoder.model.quantizer.vq.layers[0]._codebook.weight.shape[1]
 EMBED_DIM = 512
 MAX_TOKENS = 8192
 EPOCHS = 10000
 LR = 1e-4
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")
+vectors2d = audio_encoder.tokens_to_vectors(tokens2d)
 N_CODEBOOKS = tokens2d.shape[1]
+CODE_DIM = vectors2d.shape[2]
 
 transformer = SoundTransformer(
     vocab_size=VOCAB_PER_CB,
@@ -134,13 +135,7 @@ for epoch in range(1, EPOCHS + 1):
 
     preds = transformer(lyr, x)
     with torch.no_grad():
-        cb_tables = [
-            audio_encoder.model.quantizer.vq.layers[c]._codebook.weight.to(x.device)
-            for c in range(N_CODEBOOKS)
-        ]
-        tgt = torch.stack([
-            cb_tables[c][x[..., c]] for c in range(N_CODEBOOKS)
-        ], dim=2)
+        tgt = audio_encoder.tokens_to_vectors(x)
 
     preds = preds[:, :-1]
     tgt = tgt[:, 1:]
