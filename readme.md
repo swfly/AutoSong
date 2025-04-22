@@ -104,97 +104,150 @@ Now can actually "learn" multi-channel generating.
 
 ```
 
-## 🧮 Transformer Mechanics – Mathematical Summary
+## 🧮 Transformer Mechanics — Updated Mathematical Summary
 
-This section explains the internal mechanics of the SoundTransformer using mathematical notation.
+This section details the mathematical operations of the **SoundTransformer**, which autoregressively predicts audio token sequences conditioned on lyrics embeddings.
 
-### 🔸 Input Embeddings
+### 🔹 Input: Audio Tokens
 
-Each audio input is a sequence of discrete tokens from multiple codebooks (channels), represented as a tensor of shape \( [B, T, C] \), where:
+Let the input audio be quantized into \( C \) discrete **codebooks**, each producing a sequence of \( T \) tokens. The input tensor has shape:
 
-- \( B \) is the batch size
-- \( T \) is the number of time steps
-- \( C \) is the number of codebooks (channels)
-
-For each token at time \( t \) and channel \( c \), its embedding is computed as:
-
-$$
-\mathbf{e}_{t, c} = \text{token\_emb}(x_{t, c}) + \text{channel\_emb}(c) + \text{pos\_emb}(t)
-$$
+\[
+\mathbf{X}_{\text{raw}} \in \mathbb{N}^{B \times T \times C}
+\]
 
 Where:
+- \( B \): Batch size  
+- \( T \): Time steps  
+- \( C \): Number of codebooks (channels)  
+- Each token \( x_{b,t,c} \in \{0, \dots, V - 1\} \), with \( V \) the vocabulary size per codebook
 
-- \( x_{t, c} \in \{0, \dots, V - 1\} \) is the token ID at timestep \( t \), channel \( c \)
-- \( \text{token\_emb} \in \mathbb{R}^{V \times d} \) is the shared embedding lookup table for token IDs
-- \( \text{channel\_emb}(c) \in \mathbb{R}^d \) is a learned embedding for the codebook index \( c \)
-- \( \text{pos\_emb}(t) \in \mathbb{R}^d \) is a learned positional embedding for time \( t \)
-- All embeddings are in \( \mathbb{R}^d \), the transformer model dimension
+Each token is embedded as:
 
-The embeddings are computed and summed **per token per channel**, then reshaped to a flattened sequence \( [B, T \cdot C, d] \) before being processed by the decoder stack.
+\[
+\mathbf{e}_{t, c} = \text{Embed}(x_{t, c}) + \text{ChannelEmb}(c) + \text{PosEmb}(t)
+\]
 
-This multi-channel embedding formulation preserves:
-- **Temporal ordering** across time steps (via positional embeddings)
-- **Semantic separation** across codebooks (via channel embeddings)
-- **Discrete token identity** (via token embeddings)
+Resulting in:
 
+\[
+\mathbf{E} \in \mathbb{R}^{B \times T \times C \times d}
+\]
 
----
+This is reshaped into a flat sequence:
 
-### 🔸 Text Embedding ("Memory")
-
-Lyrics are encoded using a frozen BERT model to produce token-level hidden states:
-
-$$
-\mathbf{L} = \text{BERT}(\text{lyrics}) \in \mathbb{R}^{T_{\text{lyr}} \times d'}
-$$
-
+\[
+\mathbf{E}' = \text{reshape}(\mathbf{E}) \in \mathbb{R}^{B \times (T \cdot C) \times d}
+\]
 
 ---
 
-### 🔸 Decoder Layer – Self + Cross Attention
+### 🔹 Conditioning: Lyrics Embedding
 
-Each decoder layer applies both causal self-attention and lyric-conditioned cross-attention:
+Lyrics are encoded as a sequence of pinyin tokens using a frozen embedding table:
 
-#### 1. Causal Self-Attention
+\[
+\mathbf{L}_{\text{raw}} = \text{TextEncoder}(\text{lyrics}) \in \mathbb{N}^{B \times T_{\text{text}}}
+\]
 
-$$
-Q = XW_Q^{\text{(self)}}, \quad K = XW_K^{\text{(self)}}, \quad V = XW_V^{\text{(self)}}
-$$
+Which are embedded with position:
 
-$$
-\text{SelfAttn}(Q, K, V) = \text{softmax}\left( \frac{QK^\top}{\sqrt{d}} + \text{mask} \right)V
-$$
+\[
+\mathbf{L} = \text{PhonemeEmbed}(\mathbf{L}_{\text{raw}}) + \text{PosEmb}_{\text{text}}
+\quad \in \mathbb{R}^{B \times T_{\text{text}} \times d}
+\]
 
-#### 2. Cross-Attention over Lyrics (Memory)
+A learned linear projection aligns dimensions:
 
-The lyrics embedding is first projected to match the transformer’s embedding size:
+\[
+\mathbf{M} = \mathbf{L} \cdot \mathbf{W}_{\text{proj}} \in \mathbb{R}^{B \times T_{\text{text}} \times d}
+\]
 
-$$
-\mathbf{M} = \mathbf{L} \cdot \mathbf{W}_{\text{proj}} \in \mathbb{R}^{T_{\text{lyr}} \times d}
-$$
-
-This becomes the **memory** (M) used in cross-attention.
-$$
-Q = XW_Q^{\text{(cross)}}, \quad K = MW_K^{\text{(cross)}}, \quad V = MW_V^{\text{(cross)}}
-$$
-
-$$
-\text{CrossAttn}(Q, K, V) = \text{softmax}\left( \frac{QK^\top}{\sqrt{d}} \right)V
-$$
+This becomes the **cross-attention memory**.
 
 ---
 
-### 🔸 Feedforward and Residual Layers
+### 🔹 Decoder Layer: Causal Self-Attention + Cross-Attention
 
-Each transformer layer wraps these operations in standard residual connections:
+Each decoder layer applies:
 
-$$
-X \leftarrow \text{LayerNorm}(X + \text{SelfAttn}(X)) \\
-X \leftarrow \text{LayerNorm}(X + \text{CrossAttn}(X, M)) \\
-X \leftarrow \text{LayerNorm}(X + \text{MLP}(X))
-$$
+#### 1. Causal Self-Attention over Audio Tokens
 
-Where MLP is a two-layer feedforward network with GELU activation.
+\[
+\mathbf{Q} = \mathbf{X} \mathbf{W}_Q^{\text{(self)}}, \quad
+\mathbf{K} = \mathbf{X} \mathbf{W}_K^{\text{(self)}}, \quad
+\mathbf{V} = \mathbf{X} \mathbf{W}_V^{\text{(self)}}
+\]
+
+\[
+\text{SelfAttn}(\mathbf{X}) = \text{softmax} \left( \frac{\mathbf{QK}^\top}{\sqrt{d}} + \text{CausalMask} \right) \mathbf{V}
+\]
+
+#### 2. Cross-Attention to Lyrics (Memory)
+
+\[
+\mathbf{Q}_{\text{cross}} = \mathbf{X} \mathbf{W}_Q^{\text{(cross)}}, \quad
+\mathbf{K}_{\text{cross}} = \mathbf{M} \mathbf{W}_K^{\text{(cross)}}, \quad
+\mathbf{V}_{\text{cross}} = \mathbf{M} \mathbf{W}_V^{\text{(cross)}}
+\]
+
+\[
+\text{CrossAttn}(\mathbf{X}, \mathbf{M}) = \text{softmax} \left( \frac{\mathbf{Q}_{\text{cross}} \mathbf{K}_{\text{cross}}^\top}{\sqrt{d}} \right) \mathbf{V}_{\text{cross}}
+\]
+
+---
+
+### 🔹 Feedforward and Residual Processing
+
+Each layer wraps attention and MLP in residual blocks:
+
+\[
+\mathbf{X} \leftarrow \text{LayerNorm}(\mathbf{X} + \text{SelfAttn}(\mathbf{X}))
+\]
+
+\[
+\mathbf{X} \leftarrow \text{LayerNorm}(\mathbf{X} + \text{CrossAttn}(\mathbf{X}, \mathbf{M}))
+\]
+
+\[
+\mathbf{X} \leftarrow \text{LayerNorm}(\mathbf{X} + \text{MLP}(\mathbf{X}))
+\]
+
+With:
+
+\[
+\text{MLP}(\mathbf{X}) = \text{Dropout}(\mathbf{W}_2 \cdot \text{GELU}(\mathbf{W}_1 \cdot \mathbf{X}))
+\]
+
+---
+
+### 🔹 Output: Token Prediction with LoRA Adaptation
+
+After \( L \) decoder layers:
+
+\[
+\mathbf{H} \in \mathbb{R}^{B \times T \times C \times d}
+\]
+
+Shared output projection:
+
+\[
+\text{logits}_{\text{shared}} = \mathbf{H} \cdot \mathbf{W}_{\text{shared}}^\top \in \mathbb{R}^{B \times T \times C \times V}
+\]
+
+Optional LoRA-style per-channel adaptation:
+
+\[
+\text{logits}_{\text{LoRA}}^{(c)} = (\mathbf{H}_{:, :, c, :} \cdot \mathbf{U}^{(c)}) \cdot \mathbf{V}^{(c)\top}
+\]
+
+Final logits:
+
+\[
+\text{logits}^{(c)} = \text{logits}_{\text{shared}}^{(c)} + \text{logits}_{\text{LoRA}}^{(c)}
+\]
+
+This provides channel-aware output with efficient low-rank tuning capacity.
 
 ---
 
