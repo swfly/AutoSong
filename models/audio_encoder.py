@@ -27,9 +27,11 @@ class AudioEncoder:
         Map integer tokens ∈ [B, T, C] to their codebook vectors ∈ [B, T, C, D].
         """
         dev = tokens.device
-        cb_tables = [self.model.quantizer.vq.layers[c]._codebook.codebook.to(dev)
+        cb_tables = [self.model.quantizer.vq.layers[c]._codebook.embed.to(dev)
                     for c in range(self.channels)]
         return torch.stack([cb_tables[c][tokens[..., c]] for c in range(self.channels)], dim=2)
+
+
     def encode(self, wav_path: str) -> torch.Tensor:
         """
         Encode audio file into a sequence of quantized tokens.

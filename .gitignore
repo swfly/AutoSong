@@ -30,7 +30,7 @@ test.wav
 *.flac
 *.wav
 *.ogg
-
+dataset/**
 # ──────── Notebooks ──────── #
 .ipynb_checkpoints/
 
