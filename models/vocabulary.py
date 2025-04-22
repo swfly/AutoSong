@@ -1,15 +1,15 @@
 def generate_pinyin_vocab() -> list[str]:
     """
-    Generate a complete list of valid Mandarin Pinyin syllables with tones (1–5).
-
-    Returns
-    -------
-    vocab : list[str]
-        A list of pinyin syllables like ['wo3', 'ai4', 'ni3', ..., 'zhi1', 'zhuang4']
+    Generate a complete list of valid Mandarin Pinyin syllables, with:
+    - Tones 1–5
+    - Toneless form (轻音)
+    - Basic formatting chars like space, newline
     """
+
     initials = [
-        "", "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x",
-        "zh", "ch", "sh", "r", "z", "c", "s", "y", "w"
+        "", "b", "p", "m", "f", "d", "t", "n", "l",
+        "g", "k", "h", "j", "q", "x", "zh", "ch", "sh",
+        "r", "z", "c", "s", "y", "w"
     ]
     finals = [
         "a", "ai", "an", "ang", "ao",
@@ -25,11 +25,21 @@ def generate_pinyin_vocab() -> list[str]:
         for fin in finals:
             if ini == "y":
                 syllable = fin if fin.startswith("i") else "y" + fin
+                base_syllables.add(syllable)
             elif ini == "w":
                 syllable = fin if fin.startswith("u") else "w" + fin
-            else:
-                syllable = ini + fin
+                base_syllables.add(syllable)
+            
+            syllable = ini + fin
             base_syllables.add(syllable)
 
+    # Add all syllables with tones 1–5
     vocab = [f"{syl}{tone}" for syl in base_syllables for tone in range(1, 6)]
-    return sorted(vocab)
+
+    # Add toneless (neutral tone, e.g., "de", "ma")
+    vocab += list(base_syllables)
+
+    # Add common formatting and special tokens
+    vocab += ["<PAD>", "<UNK>", " ", "\n", "\t", ".", ",", "!", "?", "…", "：", "；", "-", "(", ")"]
+
+    return sorted(set(vocab))

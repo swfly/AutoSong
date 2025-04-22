@@ -21,9 +21,8 @@ DEVICE = device
 text_encoder = TextEncoder(max_tokens=512).to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
-EMBED_DIM = 1024
+EMBED_DIM = 512
 MAX_TOKENS = 18000
-EPOCHS = 1000
 LR = 5e-5
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
@@ -33,7 +32,7 @@ transformer = SoundTransformer(
     n_codebooks=N_CODEBOOKS,
     embed_dim=EMBED_DIM,
     num_heads=4,
-    num_layers=8,
+    num_layers=4,
     max_seq_len=MAX_TOKENS
 ).to(DEVICE)
 
@@ -58,6 +57,7 @@ with open("test_song.txt", encoding="utf-8") as f:
     lyrics = f.read()
 with torch.no_grad():
     lyr_emb = text_encoder.encode(lyrics).to(device)
+    print(lyr_emb)
 # 🪄 Use a longer prefix from the reference sequence instead of BOS only
 PREFIX_LEN = 32  # or 512, depending on how much context you want
 SEQ = 1024

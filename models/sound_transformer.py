@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 import os, sys, random, gc
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -64,7 +65,7 @@ class SoundTransformer(nn.Module):
         self.vocab_size = vocab_size
         self.n_codebooks = n_codebooks
         
-        self.vocab = models.vocabulary.generate_pinyin_vocab() + ["<PAD>", "<UNK>"]
+        self.vocab = models.vocabulary.generate_pinyin_vocab()
         # Embedding layers
         self.token_emb = nn.Embedding(vocab_size, embed_dim)  # Embedding for token IDs
         self.channel_emb = nn.Embedding(n_codebooks, embed_dim)  # Embedding for channels
@@ -137,6 +138,9 @@ class SoundTransformer(nn.Module):
             flat_x = x.view(B, S_new * C, -1)
             seq_len = flat_x.size(1)
             mask = self.causal_mask[:seq_len, :seq_len].to(flat_x.device, flat_x.dtype)
+            # def checkpoint_forward(x):
+            #     return layer(x, memory, attn_mask=mask, past_kv=pkv, use_cache=use_cache)
+            # x, kv = checkpoint(checkpoint_forward, flat_x, use_reentrant=False)
             x, kv = layer(flat_x, memory, attn_mask=mask, past_kv=pkv, use_cache=use_cache)
             x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
             if use_cache:

@@ -10,7 +10,7 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.max_tokens = max_tokens
 
-        self.vocab = models.vocabulary.generate_pinyin_vocab() + ["<PAD>", "<UNK>"]
+        self.vocab = models.vocabulary.generate_pinyin_vocab()
         self.pad_token = "<PAD>"
         self.unk_token = "<UNK>"
 

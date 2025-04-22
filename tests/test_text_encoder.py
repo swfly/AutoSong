@@ -5,12 +5,10 @@ from models.text_encoder import TextEncoder
 def test_text_encoder():
     encoder = TextEncoder()
     encoder.eval()
-
-    # Use a real Chinese lyric
-    text = "我爱你"  # "I love you"
+    with open("test_song.txt", encoding="utf-8") as f:
+        text = f.read()
     
     token_ids = encoder.encode(text)
-    print("Token IDs:", token_ids)
     print("Shape:", token_ids.shape)  # Should be [1, max_tokens]
 
     # Decode back to pinyin

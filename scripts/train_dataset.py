@@ -32,7 +32,7 @@ def load_random_song(segment_tokens: int):
     song = random.choice([d for d in os.listdir(DATASET_DIR)
                           if os.path.isdir(os.path.join(DATASET_DIR, d))])
     path = os.path.join(DATASET_DIR, song)
-
+    print("load sample from path",path)
     # --- lyrics ------------------------------------------------- #
     txt = next(f for f in os.listdir(path) if f.endswith(".txt"))
     with open(os.path.join(path, txt), encoding="utf-8") as f:
@@ -46,9 +46,15 @@ def load_random_song(segment_tokens: int):
     audio = next(f for f in os.listdir(path) if f.endswith((".mp3", ".flac")))
     tok = audio_encoder.encode(os.path.join(path, audio))          # (T, C) on CPU
 
+    T, C = tok.shape
     if len(tok) > segment_tokens:
         start = 0  #random.randint(0, len(tok) - segment_tokens - 1)
         tok = tok[start:start + segment_tokens]
+    elif T < segment_tokens:
+        # Pad with 0s (assume 0 is <PAD> token)
+        pad_len = segment_tokens - T
+        pad = torch.full((pad_len, C), fill_value=0, dtype=tok.dtype)
+        tok = torch.cat([tok, pad], dim=0)  # → (segment_tokens, C)
         
 
     inp = tok.unsqueeze(0).to(device)  # (1, 18k)
@@ -77,10 +83,10 @@ DEVICE = device
 text_encoder = TextEncoder(max_tokens=512).to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
-EMBED_DIM = 1024
-MAX_TOKENS = 18000
-EPOCHS = 1000
-LR = 1e-4
+EMBED_DIM = 512
+MAX_TOKENS = 8192
+EPOCHS = 10000
+LR = 2e-4
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 
@@ -89,13 +95,13 @@ transformer = SoundTransformer(
     n_codebooks=N_CODEBOOKS,
     embed_dim=EMBED_DIM,
     num_heads=4,
-    num_layers=8,
+    num_layers=4,
     max_seq_len=MAX_TOKENS
 ).to(DEVICE)
 
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(transformer.parameters(), lr=LR)
+optimizer = optim.Adam(transformer.parameters(), lr=LR, weight_decay=1e-4)
 
 
 # ───────────────────────── load ───────────────────────── #
@@ -143,7 +149,7 @@ for epoch in range(1, EPOCHS + 1):
 
     print(f"[Epoch {epoch}] Loss: {total_loss.item():.4f}")
     del lyr, x, logits, total_loss
-    torch.cuda.empty_cache()
+    torch.mps.empty_cache()
     gc.collect()
 
     if epoch % 20 == 0:
