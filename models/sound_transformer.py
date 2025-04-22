@@ -91,8 +91,14 @@ class SoundTransformer(nn.Module):
             DecoderLayer(embed_dim, num_heads, dropout)
             for _ in range(num_layers)
         )
+        # Shared base projection
+        self.shared_out_proj = nn.Linear(embed_dim, vocab_size, bias=False)
 
-        self.out_proj = nn.Linear(embed_dim, vocab_size)  # Per-channel output projection
+        # Per-channel low-rank adaptation
+        self.lora_u = nn.Parameter(torch.zeros(n_codebooks, embed_dim))       # U ∈ [C, d]
+        self.lora_v = nn.Parameter(torch.zeros(n_codebooks, vocab_size))      # V ∈ [C, V]
+        nn.init.normal_(self.lora_u, std=1e-4)
+        nn.init.normal_(self.lora_v, std=1e-4)
         
         # caches
         self.max_seq_len = max_seq_len
@@ -148,7 +154,7 @@ class SoundTransformer(nn.Module):
             pkv = None if past_kv is None else past_kv[i]
             flat_x = x.view(B, S_new * C, -1)
             seq_len = flat_x.size(1)
-            attn_mask = self.time_causal_mask[:seq_len, :seq_len]
+            attn_mask = self.time_causal_mask[:seq_len, :seq_len].to(flat_x.device, flat_x.dtype)
             # def checkpoint_forward(x):
             #     return layer(x, memory, attn_mask=mask, past_kv=pkv, use_cache=use_cache)
             # x, kv = checkpoint(checkpoint_forward, flat_x, use_reentrant=False)
@@ -158,6 +164,14 @@ class SoundTransformer(nn.Module):
                 new_cache.append(kv)
 
         # --- Final output projection ------------------------------ #
-        logits = self.out_proj(x.view(B, S_new * C, -1))  # [B, S_new * C, vocab_size]
-        logits = logits.view(B, S_new, C, self.vocab_size)  # Reshape to [B, S_new, C, vocab_size]
+        x_flat = x.view(B, S_new, C, -1)                       # [B, S, C, d]
+
+        # Shared projection
+        shared_logits = self.shared_out_proj(x_flat)           # [B, S, C, V]
+
+        # LoRA projection: rank-1 residual per channel
+        lora_logits = torch.einsum("bscd,cd->bsc", x_flat, self.lora_u)      # [B, S, C]
+        lora_logits = lora_logits.unsqueeze(-1) * self.lora_v.unsqueeze(0).unsqueeze(0)  # [B, S, C, V]
+
+        logits = shared_logits + lora_logits                   # [B, S, C, V]
         return (logits, new_cache) if use_cache else logits
