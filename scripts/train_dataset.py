@@ -28,38 +28,58 @@ def get_segment_tokens(step, total_steps=10_000, min_len=200, max_len=18_000):
     length = min_len + (max_len - min_len) * growth
     return int(length)
 def load_random_song(segment_tokens: int):
-    """Return (lyrics_embed, inp, tgt) all on GPU, len == MAX_TOKENS."""
+    """Return (lyrics_embed, inp) all on GPU, len == segment_tokens. Caches encoded text/audio."""
     song = random.choice([d for d in os.listdir(DATASET_DIR)
                           if os.path.isdir(os.path.join(DATASET_DIR, d))])
     path = os.path.join(DATASET_DIR, song)
-    print("load sample from path",path)
-    # --- lyrics ------------------------------------------------- #
-    txt = next(f for f in os.listdir(path) if f.endswith(".txt"))
-    with open(os.path.join(path, txt), encoding="utf-8") as f:
-        lyrics = f.read()
-    garbage = "~" * random.randint(0, 100)
-    lyrics = garbage + lyrics  # causes `pinyin(...)` to skip those chars
-    with torch.no_grad():
-        lyr_emb = text_encoder.encode(lyrics).to(device)
+    cache_path = os.path.join(path, "cached_encoding.pt")
+    print("🔍 loading sample from", path)
 
-    # --- audio → tokens ---------------------------------------- #
-    audio = next(f for f in os.listdir(path) if f.endswith((".mp3", ".flac")))
-    tok = audio_encoder.encode(os.path.join(path, audio))          # (T, C) on CPU
+    if os.path.exists(cache_path):
+        try:
+            data = torch.load(cache_path, map_location="cpu")
+            lyrics = data["lyrics"]
+            tokens = data["tokens"]
+            print("✅ loaded cache")
+        except Exception as e:
+            print("⚠️ failed to load cache:", e)
+            lyrics, tokens = None, None
+    else:
+        lyrics, tokens = None, None
 
-    T, C = tok.shape
-    if len(tok) > segment_tokens:
-        start = 0  #random.randint(0, len(tok) - segment_tokens - 1)
-        tok = tok[start:start + segment_tokens]
+    if lyrics is None or tokens is None:
+        print("🛠️  computing new encoding...")
+        # --- lyrics ------------------------------------------------- #
+        txt = next(f for f in os.listdir(path) if f.endswith(".txt"))
+        with open(os.path.join(path, txt), encoding="utf-8") as f:
+            lyrics_txt = f.read()
+        garbage = "~" * random.randint(0, 100)
+        lyrics_txt = garbage + lyrics_txt
+        with torch.no_grad():
+            lyrics = text_encoder.encode(lyrics_txt).cpu()
+
+        # --- audio -------------------------------------------------- #
+        audio = next(f for f in os.listdir(path) if f.endswith((".mp3", ".flac")))
+        tokens = audio_encoder.encode(os.path.join(path, audio))  # (T, C)
+
+        try:
+            torch.save({"lyrics": lyrics, "tokens": tokens}, cache_path)
+            print("💾 saved cache:", cache_path)
+        except Exception as e:
+            print("⚠️ failed to save cache:", e)
+
+    T, C = tokens.shape
+    if T > segment_tokens:
+        start = 0  # You can randomize this
+        tokens = tokens[start : start + segment_tokens]
     elif T < segment_tokens:
-        # Pad with 0s (assume 0 is <PAD> token)
         pad_len = segment_tokens - T
-        pad = torch.full((pad_len, C), fill_value=0, dtype=tok.dtype)
-        tok = torch.cat([tok, pad], dim=0)  # → (segment_tokens, C)
-        
+        pad = torch.full((pad_len, C), fill_value=0, dtype=tokens.dtype)
+        tokens = torch.cat([tokens, pad], dim=0)
 
-    inp = tok.unsqueeze(0).to(device)  # (1, 18k)
-
-    return lyr_emb.detach(), inp.detach()
+    lyrics = lyrics.to(device)
+    tokens = tokens.unsqueeze(0).to(device)  # [1, T, C]
+    return lyrics.detach(), tokens.detach()
 def load_batch(batch_size: int, segment_tokens: int):
     lyrics_list = []
     tokens_list = []
@@ -86,7 +106,7 @@ VOCAB_PER_CB = audio_encoder.vocab_size
 EMBED_DIM = 512
 MAX_TOKENS = 8192
 EPOCHS = 10000
-LR = 2e-4
+LR = 1e-4
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 
@@ -101,7 +121,7 @@ transformer = SoundTransformer(
 
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(transformer.parameters(), lr=LR, weight_decay=1e-4)
+optimizer = optim.Adam(transformer.parameters(), lr=LR, weight_decay=1e-4, betas=(0.9,0.98))
 
 
 # ───────────────────────── load ───────────────────────── #
@@ -123,6 +143,7 @@ else:
     print("🆕 No checkpoint found, starting from scratch.")
 
 # ───────────────────────── train ───────────────────────── #
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10000)
 print("Starting training …")
 os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
@@ -145,6 +166,7 @@ for epoch in range(1, EPOCHS + 1):
     total_loss = criterion(logits_flat, targets_flat)
     total_loss.backward()
     optimizer.step()
+    scheduler.step()
 
 
     print(f"[Epoch {epoch}] Loss: {total_loss.item():.4f}")

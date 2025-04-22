@@ -43,7 +43,18 @@ class DecoderLayer(nn.Module):
         x = self.norm3(x + self.drop(self.mlp(x)))
         return x, None
 
-
+# --- helper -------------------------------------------------------------
+def build_time_causal_mask(max_t: int, n_codebooks: int,
+                           device="cpu", dtype=torch.float32):
+    """
+    Return a mask of shape [max_t * C, max_t * C] where entry (i,j) = 0
+    iff the *time step* of j is ≤ that of i, otherwise -inf.
+    """
+    idx = torch.arange(max_t * n_codebooks, device=device)
+    t  = idx // n_codebooks                      # time index of every position
+    mask = (t.unsqueeze(0) < t.unsqueeze(1))     # True if j is strictly *future*
+    mask = mask.to(dtype).masked_fill(mask, float("-inf"))
+    return mask
 class SoundTransformer(nn.Module):
     def __init__(
         self,
@@ -86,10 +97,10 @@ class SoundTransformer(nn.Module):
         # caches
         self.max_seq_len = max_seq_len
         self.register_buffer("channel_ids", torch.arange(n_codebooks))
-        self.register_buffer(
-            "causal_mask",
-            torch.triu(torch.full((max_seq_len, max_seq_len), float("-inf")), diagonal=1)
-        )
+        full_mask = build_time_causal_mask(max_seq_len,
+                                                n_codebooks,
+                                                dtype=torch.float32)
+        self.register_buffer("time_causal_mask", full_mask)  # [T*C, T*C]
     def forward(
         self,
         lyrics: torch.Tensor,  # [B, S_text, D]  (full sequence)
@@ -137,11 +148,11 @@ class SoundTransformer(nn.Module):
             pkv = None if past_kv is None else past_kv[i]
             flat_x = x.view(B, S_new * C, -1)
             seq_len = flat_x.size(1)
-            mask = self.causal_mask[:seq_len, :seq_len].to(flat_x.device, flat_x.dtype)
+            attn_mask = self.time_causal_mask[:seq_len, :seq_len]
             # def checkpoint_forward(x):
             #     return layer(x, memory, attn_mask=mask, past_kv=pkv, use_cache=use_cache)
             # x, kv = checkpoint(checkpoint_forward, flat_x, use_reentrant=False)
-            x, kv = layer(flat_x, memory, attn_mask=mask, past_kv=pkv, use_cache=use_cache)
+            x, kv = layer(flat_x, memory, attn_mask=attn_mask, past_kv=pkv, use_cache=use_cache)
             x = x.view(B, S_new, C, -1)  # Reshape back to [B, S_new, C, embed_dim]
             if use_cache:
                 new_cache.append(kv)
