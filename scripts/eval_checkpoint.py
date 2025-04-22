@@ -53,12 +53,11 @@ else:
 
 
 # ───────────────────────── generate ───────────────────────── #
-lyrics = "明天你好\n在一片蓝色月光下"
-# with open("dataset/song_001/song_001.txt", encoding="utf-8") as f:
-#     lyrics = f.read()
+# lyrics = "明天你好\n在一片蓝色月光下"
+with open("test_song.txt", encoding="utf-8") as f:
+    lyrics = f.read()
 with torch.no_grad():
     lyr_emb = text_encoder.encode(lyrics).to(device)
-print(lyr_emb)
 # 🪄 Use a longer prefix from the reference sequence instead of BOS only
 PREFIX_LEN = 32  # or 512, depending on how much context you want
 SEQ = 1024

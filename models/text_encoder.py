@@ -47,7 +47,7 @@ class TextEncoder(nn.Module):
         return self.encode(text)
 
     def _chinese_to_pinyin(self, text: str) -> list[str]:
-        py = pinyin(text, style=Style.TONE3, errors="ignore", strict=False)
+        py = pinyin(list(text), style=Style.TONE3, errors="default", strict=False)
         return [item[0] for item in py if item]
 
         py = pinyin(text, style=Style.TONE3, errors="ignore", strict=False)

@@ -15,7 +15,7 @@ from models.sound_transformer import SoundTransformer
 # ──────────────────── helper: load one song ──────────────────── #
 DATASET_DIR   = "dataset"
 def get_segment_tokens(step, total_steps=10_000, min_len=200, max_len=18_000):
-    return 2048
+    return 4096
     """Smooth nonlinear segment schedule from 200 to 18k over 10k steps."""
     # Logistic growth curve parameters
     s0 = 4000           # inflection point (shift right if you want slower growth)
@@ -37,6 +37,8 @@ def load_random_song(segment_tokens: int):
     txt = next(f for f in os.listdir(path) if f.endswith(".txt"))
     with open(os.path.join(path, txt), encoding="utf-8") as f:
         lyrics = f.read()
+    garbage = "~" * random.randint(0, 100)
+    lyrics = garbage + lyrics  # causes `pinyin(...)` to skip those chars
     with torch.no_grad():
         lyr_emb = text_encoder.encode(lyrics).to(device)
 
