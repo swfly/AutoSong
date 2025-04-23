@@ -22,8 +22,7 @@ text_encoder = TextEncoder(max_tokens=512).to(torch.device("cpu"))
 audio_encoder = AudioEncoder(device="cpu")
 VOCAB_PER_CB = audio_encoder.vocab_size
 EMBED_DIM = 512
-MAX_TOKENS = 18000
-LR = 5e-5
+MAX_TOKENS = 8192
 tokens2d = audio_encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 N_CODEBOOKS = tokens2d.shape[1]
 
@@ -40,7 +39,7 @@ transformer = SoundTransformer(
 
 # ───────────────────────── load ───────────────────────── #
 if os.path.exists(CHECKPOINT_PATH):
-    print(f"🔁 Found checkpoint at {CHECKPOINT_PATH}, resuming training...")
+    print(f"🔁 Found checkpoint at {CHECKPOINT_PATH}")
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         transformer.load_state_dict(checkpoint["model_state_dict"])
@@ -59,7 +58,7 @@ with torch.no_grad():
     lyr_emb = text_encoder.encode(lyrics).to(device)
     print(lyr_emb)
 # 🪄 Use a longer prefix from the reference sequence instead of BOS only
-PREFIX_LEN = 32  # or 512, depending on how much context you want
+PREFIX_LEN = 64  # or 512, depending on how much context you want
 SEQ = 1024
 prefix = tokens2d[:PREFIX_LEN].unsqueeze(0).to(DEVICE)  # shape [1, P]
 gen = prefix.clone()  # will grow during generation

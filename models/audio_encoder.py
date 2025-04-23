@@ -2,7 +2,8 @@ import torch
 from encodec import EncodecModel
 from encodec.utils import convert_audio
 import torchaudio
-
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 class AudioEncoder:
     def __init__(self, device="cuda", sample_rate=24000, bandwidth=1.5):
         self.device = device

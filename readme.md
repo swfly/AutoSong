@@ -273,6 +273,55 @@ To enable this, the system is trained on entire song spans (up to 18,000 EnCodec
 
 While this demands significantly more VRAM and compute than local models, it is essential to the goal of coherent music generation from start to finish.
 
+## 🚧 New Direction: Two-Stage Generation with VAE & AR
+
+To improve the structure and semantic coherence of generated music, we are shifting to a **two-stage architecture** that separates **latent content modeling** from **low-level audio generation**. This approach introduces a learned **VQ-VAE** to produce meaningful, compact latent representations, enabling a more structured and efficient autoregressive modeling stage.
+
+---
+
+### 🧱 Architecture Overview
+
+1. **Stage 1: VQ-VAE**
+
+    - The VQ-VAE compresses each audio segment into a pair of discrete latent codes:
+        - One represents **general acoustic content** (e.g., instrumental texture)
+        - The other can optionally represent **vocal content**, and may be zeroed during training to simulate instrumental-only inputs
+
+    - During training, the VQ-VAE decoder reconstructs a segment using **contextual latent input**:
+        ```
+        [ z_prev_0, z_prev_1,  z_curr_0, z_curr_1,  z_next_0, z_next_1 ]
+        ```
+
+    - The VQ-VAE operates directly on **EnCodec token sequences** and learns to reconstruct them using a 6-block latent input context.
+
+2. **Stage 2: Autoregressive Transformer**
+
+    - A GPT-style transformer is trained to **autoregress over the VQ-VAE latent codes**, conditioned on full lyrics and genre.
+    - This stage models high-level musical form, phrasing, and structural dependencies at the latent level.
+    - Input: `[lyrics]` → Output: `[z₁, z₂, ..., zₖ]`
+    - These predicted latents are then passed to the VQ-VAE decoder to generate full EnCodec sequences and ultimately audio.
+
+---
+
+### 🎯 Why This Design?
+
+This hierarchical factorization addresses multiple limitations of the earlier flat token autoregression approach:
+
+- **Latent Compression**: Reduces sequence length and entropy for the AR model
+- **Semantic Abstraction**: Latent tokens are learned, not fixed EnCodec tokens, enabling meaningful reuse and structure
+- **Decoupled Roles**:
+    - VQ-VAE handles **acoustic realism** and local fidelity
+    - Transformer handles **structure and lyrical alignment**
+
+---
+
+### 🔄 Training Strategy
+
+- **VQ-VAE** is trained first in isolation using a reconstruction objective over EnCodec tokens.
+- The **AR Transformer** is then trained over sequences of VQ latents.
+- Final system can be fine-tuned jointly or kept modular depending on compute constraints.
+
+---
 
 ## 🧪 Formal Full-Context Training
 This project includes a **formal training script** that performs full-sequence training with constant VRAM usage. The goal is to explore generalization from lyrics and genre across a dataset of diverse music tracks.
