@@ -70,13 +70,10 @@ if os.path.exists(CHECKPOINT_PATH):
 tokens_prev = torch.stack(segments[:-2]).to(device)  # [B, T, C]
 tokens_curr = torch.stack(segments[1:-1]).to(device)
 tokens_next = torch.stack(segments[2:]).to(device)
-tokens_prev = torch.stack(segments[0:1]).to(device)  # [B, T, C]
-tokens_curr = torch.stack(segments[1:2]).to(device)
-tokens_next = torch.stack(segments[2:3]).to(device)
 triplet_dataset = TensorDataset(tokens_prev, tokens_curr, tokens_next)
 model.train()
 print("🚀 Starting overfitting loop on single song …")
-BATCH_SIZE = 1
+BATCH_SIZE = 16
 loader = DataLoader(triplet_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 div_loss_scale = 0.0
 for epoch in range(start_epoch, EPOCHS + 1):
@@ -84,8 +81,9 @@ for epoch in range(start_epoch, EPOCHS + 1):
     total_loss = total_recon = total_vq = total_div = 0.0
 
     for batch in loader:
+    # for i in range(1):
         batch_prev, batch_curr, batch_next = [x.to(device) for x in batch]
-
+        # batch_prev, batch_curr, batch_next = (tokens_prev, tokens_curr, tokens_next)
         optimizer.zero_grad()
         loss, metrics = model(
             batch_prev, batch_curr, batch_next,
@@ -111,12 +109,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
     if epoch % 50 == 0 or epoch == EPOCHS:
         # Sample one batch to measure code usage
-        with torch.no_grad():
-            _, code_ids, _ = model.vq(model.encoder(batch_curr))
-            codes_used = code_ids.unique().numel()
-            div_loss_scale = 0.01 * (1.0 - math.exp(-0.02 * (codes_used - 1)))
+        # with torch.no_grad():
+            # _, code_ids, _ = model.vq(model.encoder(batch_curr))
+            # codes_used = code_ids.unique().numel()
+            # div_loss_scale = 0.01 * (1.0 - math.exp(-0.02 * (codes_used - 1)))
 
-        print(f"🧱 Unique codes used: {codes_used} | div loss scale = {div_loss_scale:.4f}")
+        # print(f"🧱 Unique codes used: {codes_used} | div loss scale = {div_loss_scale:.4f}")
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
