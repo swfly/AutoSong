@@ -13,51 +13,54 @@ import math
 # Number of latent blocks per segment (unused in this minimal AE, kept for API)
 POOL_SIZE = 8
 
-class SegmentEncoder(nn.Module):
+class PositionalEncoding(nn.Module):
+    def __init__(self, dim: int, max_len: int = 512):
+        super().__init__()
+        pe = torch.zeros(max_len, dim)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.pe = pe.unsqueeze(0)  # (1, T, D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, :x.size(1), :].to(x.device)
+
+
+
+class TransformerSegmentEncoder(nn.Module):
     def __init__(
         self,
         vocab_size: int,
         n_codebooks: int,
         emb_dim: int,
         latent_dim: int,
-        n_latent_blocks: int  # number of (z_instru, z_vocal) pairs per segment
+        n_latent_blocks: int
     ):
         super().__init__()
-        self.n_codebooks = n_codebooks
-        self.emb_dim = emb_dim
-        self.latent_dim = latent_dim
-        self.n_latent_blocks = n_latent_blocks
+        self.emb = nn.Embedding(vocab_size, emb_dim)
+        self.pos_enc = PositionalEncoding(emb_dim * n_codebooks)
+        self.proj_in = nn.Linear(emb_dim * n_codebooks, latent_dim * 2)
 
-        self.token_emb = nn.Embedding(vocab_size, emb_dim)
-
-        input_dim = emb_dim * n_codebooks
-        hidden_dim = 2 * latent_dim
-
-        self.encoder_cnn = nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim, 2 * latent_dim, kernel_size=1),  # outputs instru + vocal
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=latent_dim * 2, nhead=4, dim_feedforward=512),
+            num_layers=1
         )
 
+        self.pool = nn.AdaptiveAvgPool1d(n_latent_blocks)
+
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        tokens: (B, T=256, C)
-        returns:
-          z_instru: (B, N, D)
-          z_vocal : (B, N, D)
-        """
         B, T, C = tokens.shape
-        x = self.token_emb(tokens)                        # (B, T, C, emb)
-        x = x.view(B, T, -1).permute(0, 2, 1)             # (B, emb*C, T)
-        x = self.encoder_cnn(x)                           # (B, 2*D, T)
+        x = self.emb(tokens).view(B, T, -1)  # (B, T, C*emb)
+        x = self.pos_enc(x)                 # (B, T, D)
+        x = self.proj_in(x)                 # (B, T, 2D)
+        x = x.permute(1, 0, 2)              # → (T, B, D)
+        x = self.transformer(x)             # (T, B, 2D)
+        x = x.permute(1, 2, 0)              # → (B, 2D, T)
+        x = self.pool(x).permute(0, 2, 1)   # (B, N, 2D)
+        return x.chunk(2, dim=-1)           # (B, N, D), (B, N, D)
 
-        # Pool to fixed N blocks (latent units)
-        x = F.adaptive_avg_pool1d(x, self.n_latent_blocks)  # (B, 2*D, N)
-        x = x.permute(0, 2, 1)                             # (B, N, 2*D)
-
-        z_instru, z_vocal = x.chunk(2, dim=-1)            # → each (B, N, D)
-        return z_instru, z_vocal
-class SegmentDecoder(nn.Module):
+class TransformerSegmentDecoder(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -67,25 +70,17 @@ class SegmentDecoder(nn.Module):
         seg_len: int
     ):
         super().__init__()
+        self.seg_len = seg_len
         self.vocab_size = vocab_size
         self.n_codebooks = n_codebooks
-        self.seg_len = seg_len
 
-        # Total input dim: 6 sets of (N, D)
-        self.input_dim = 6 * latent_dim * n_latent_blocks
+        input_dim = 6 * latent_dim * n_latent_blocks
         hidden_dim = 512
 
         self.fc = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-        )
-
-        self.decoder_conv = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(hidden_dim, vocab_size * n_codebooks, kernel_size=1),
+            nn.Linear(hidden_dim, seg_len * n_codebooks * vocab_size),
         )
 
     def forward(
@@ -94,25 +89,17 @@ class SegmentDecoder(nn.Module):
         z_curr_instru, z_curr_vocal,
         z_next_instru, z_next_vocal
     ) -> torch.Tensor:
-        """
-        Each input: (B, N, D)
-        Output logits: (B, T, C, V)
-        """
-        z_all = torch.cat([
+        B = z_curr_instru.size(0)
+        z = torch.cat([
             z_prev_instru, z_prev_vocal,
             z_curr_instru, z_curr_vocal,
             z_next_instru, z_next_vocal
-        ], dim=1)  # → (B, 6N, D)
+        ], dim=1)                   # (B, 6N, D)
+        z = z.view(B, -1)           # (B, 6ND)
+        out = self.fc(z)            # (B, T*C*V)
+        out = out.view(B, self.seg_len, self.n_codebooks, self.vocab_size)
+        return out                  # (B, T, C, V)
 
-        z = z_all.view(z_all.size(0), -1)       # → (B, 6ND)
-        h = self.fc(z)                          # → (B, hidden)
-        h = h.unsqueeze(-1).expand(-1, -1, self.seg_len)  # (B, hidden, T)
-        out = self.decoder_conv(h)              # (B, VC, T)
-
-        B, VC, T = out.shape
-        out = out.view(B, self.n_codebooks, self.vocab_size, T)
-        out = out.permute(0, 3, 1, 2)           # (B, T, C, V)
-        return out
 
 class SegmentVQVAE(nn.Module):
     """
@@ -136,9 +123,9 @@ class SegmentVQVAE(nn.Module):
         self.vocab_size  = vocab_size
         self.pair = block_pairs
 
-        self.encoder = SegmentEncoder(vocab_size=vocab_size, n_codebooks=n_codebooks,
+        self.encoder = TransformerSegmentEncoder(vocab_size=vocab_size, n_codebooks=n_codebooks,
                             emb_dim=emb_dim, latent_dim=latent_dim, n_latent_blocks=block_pairs)
-        self.decoder = SegmentDecoder(vocab_size=vocab_size, n_codebooks=n_codebooks,
+        self.decoder = TransformerSegmentDecoder(vocab_size=vocab_size, n_codebooks=n_codebooks,
                             latent_dim=latent_dim, n_latent_blocks=block_pairs, seg_len=seg_len)
 
 
