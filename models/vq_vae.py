@@ -13,7 +13,25 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+ 
+# ────────────────────────── new constants ──────────────────────────
+ENTROPY_WEIGHT = 0.25   # γ for codebook‐entropy regularizer
+NCE_WEIGHT     = 0.10   # λ for latent predictive InfoNCE
 
+def info_nce_loss(z: torch.Tensor, tau: float = 0.1) -> torch.Tensor:
+    """
+    z: (B, N, D) latent sequence (e.g. pre‐VQ outputs)
+    Computes InfoNCE between each block and its next neighbor,
+    using all others in–batch as negatives.
+    """
+    B, N, D = z.shape
+    # positives: t→t+1
+    z0 = F.normalize(z[:, :-1, :].reshape(-1, D), dim=-1)  # (B*(N-1), D)
+    z1 = F.normalize(z[:,  1:, :].reshape(-1, D), dim=-1)
+    # similarity matrix
+    sim = z0 @ z1.T                     # (B*(N-1), B*(N-1))
+    labels = torch.arange(sim.size(0), device=z.device)
+    return F.cross_entropy(sim / tau, labels)
 
 # ───────────────────────── quantiser ──────────────────────────
 class VectorQuantizer(nn.Module):
@@ -36,15 +54,18 @@ class VectorQuantizer(nn.Module):
         # EMA buffers
         self.register_buffer('ema_cluster_size', torch.zeros(self.K))
         self.register_buffer('ema_w', self.embed.weight.data.clone())
-
-    def code_usage_histogram(self, codes: torch.Tensor) -> torch.Tensor:
-        """
-        Returns code usage histogram over the batch.
-        codes: (B, N)
-        """
-        hist = torch.bincount(codes.flatten(), minlength=self.K).float()
-        return hist
     
+    def code_usage_histogram(self, codes: torch.LongTensor) -> torch.Tensor:
+        """
+        codes: (B, N)
+        returns: (K,) counts of each code index
+        """
+        hist = torch.bincount(
+            codes.view(-1),
+            minlength=self.K
+        ).float()
+        return hist
+
     def forward(self, z: torch.Tensor):
         # z: (B, N, D)
         B, N, D = z.shape
@@ -272,33 +293,22 @@ class SegmentVQVAE(nn.Module):
         c_i, c_v = self.encoder(tokens_curr)
         n_i, n_v = self.encoder(tokens_next)
 
-        if use_vq:
-            # Quantize normally
-            p_i_q, _, vq_pi = self.vq_instru(p_i)
-            c_i_q, _, vq_ci = self.vq_instru(c_i)
-            n_i_q, _, vq_ni = self.vq_instru(n_i)
+        # ───– InfoNCE on latent blocks (temporal predictive) ────
+        nce_i = info_nce_loss(c_i)
+        nce_v = info_nce_loss(c_v)
+        nce_loss = nce_i + nce_v
 
-            p_v_q, _, vq_pv = self.vq_vocal(p_v)
-            c_v_q, _, vq_cv = self.vq_vocal(c_v)
-            n_v_q, _, vq_nv = self.vq_vocal(n_v)
+    
+        # Quantize normally (now capturing code indices)
+        p_i_q, codes_pi, vq_pi = self.vq_instru(p_i)
+        c_i_q, codes_ci, vq_ci = self.vq_instru(c_i)
+        n_i_q, codes_ni, vq_ni = self.vq_instru(n_i)
 
-            vq_loss = vq_pi + vq_ci + vq_ni + vq_pv + vq_cv + vq_nv
-        else:
-            # 🔥 Warm-up: bypass quantization, use embedding directly
-            with torch.no_grad():
-                B, N, D = c_i.shape
-                rand_idx_i = torch.randint(0, self.vq_instru.K, size=(B, N), device=c_i.device)
-                rand_idx_v = torch.randint(0, self.vq_vocal.K, size=(B, N), device=c_i.device)
+        p_v_q, codes_pv, vq_pv = self.vq_vocal(p_v)
+        c_v_q, codes_cv, vq_cv = self.vq_vocal(c_v)
+        n_v_q, codes_nv, vq_nv = self.vq_vocal(n_v)
 
-            p_i_q = self.vq_instru.embed(rand_idx_i)
-            c_i_q = self.vq_instru.embed(rand_idx_i)
-            n_i_q = self.vq_instru.embed(rand_idx_i)
-
-            p_v_q = self.vq_vocal.embed(rand_idx_v)
-            c_v_q = self.vq_vocal.embed(rand_idx_v)
-            n_v_q = self.vq_vocal.embed(rand_idx_v)
-
-            vq_loss = torch.tensor(0.0, device=c_i.device)
+        vq_loss = vq_pi + vq_ci + vq_ni + vq_pv + vq_cv + vq_nv
 
         logits = self.decoder(
             p_i_q, p_v_q,
@@ -312,26 +322,35 @@ class SegmentVQVAE(nn.Module):
             reduction="mean"
         )
 
-        hist_i = self.vq_instru.code_usage_histogram(torch.cat([codes.view(B, -1) for codes in [c_i, p_i, n_i]], dim=1))
-        hist_v = self.vq_vocal.code_usage_histogram(torch.cat([codes.view(B, -1) for codes in [c_v, p_v, n_v]], dim=1))
-        hist = hist_i + hist_v
-        prob = hist / (hist.sum() + 1e-8)
+        # ───– Codebook‐usage entropy regulariser ────
+        hist_i = (
+            self.vq_instru.code_usage_histogram(codes_pi)
+          + self.vq_instru.code_usage_histogram(codes_ci)
+          + self.vq_instru.code_usage_histogram(codes_ni)
+        )
+        hist_v = (
+            self.vq_vocal.code_usage_histogram(codes_pv)
+          + self.vq_vocal.code_usage_histogram(codes_cv)
+          + self.vq_vocal.code_usage_histogram(codes_nv)
+        )
+        code_hist = hist_i + hist_v                      # (K,)
+        prob = code_hist / (code_hist.sum() + 1e-8)
         entropy_loss = -(prob * torch.log(prob + 1e-8)).sum()
 
-        nce_loss = info_nce_loss(c_i) + info_nce_loss(c_v)
-        
-        gamma_ent = 0.25
-        lambda_nce = 0.1
-
-        total_loss = recon_loss + vq_loss + gamma_ent * entropy_loss + lambda_nce * nce_loss
-
+        total_loss = (
+              recon_loss
+            + vq_loss
+            + ENTROPY_WEIGHT * entropy_loss
+            + NCE_WEIGHT     * nce_loss
+        )
         return total_loss, {
-            "recon_loss": recon_loss.detach(),
-            "vq_loss":    vq_loss.detach(),
-            "entropy":    entropy_loss.detach(),
-            "nce":        nce_loss.detach(),
-            "total":      total_loss.detach(),
+            "recon_loss":    recon_loss.detach(),
+            "vq_loss":       vq_loss.detach(),
+            "entropy_loss":  entropy_loss.detach(),
+            "nce_loss":      nce_loss.detach(),
+            "total":         total_loss.detach(),
         }
+
     def train_ae(
         self,
         tokens_prev: torch.Tensor,
@@ -383,23 +402,6 @@ class SegmentVQVAE(nn.Module):
 
 
 # ───────────────────────── utility ────────────────────────────
-def info_nce_loss(z: torch.Tensor, tau: float = 0.1) -> torch.Tensor:
-    """
-    z: (B, N, D)
-    Computes in-batch InfoNCE loss for latent continuity.
-    Positive: z[t+1], Negatives: other samples.
-    """
-    B, N, D = z.shape
-    z0 = z[:, :-1, :].reshape(-1, D)  # (B*(N-1), D)
-    z1 = z[:, 1:, :].reshape(-1, D)
-
-    z0 = F.normalize(z0, dim=-1)
-    z1 = F.normalize(z1, dim=-1)
-    sim = z0 @ z1.T  # (B*(N-1), B*(N-1))
-    labels = torch.arange(sim.size(0), device=z.device)
-    return F.cross_entropy(sim / tau, labels)
-
-
 def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
     """
     Split a (T, C) token grid into fixed-length segments, zero-padding the last.
