@@ -37,6 +37,14 @@ class VectorQuantizer(nn.Module):
         self.register_buffer('ema_cluster_size', torch.zeros(self.K))
         self.register_buffer('ema_w', self.embed.weight.data.clone())
 
+    def code_usage_histogram(self, codes: torch.Tensor) -> torch.Tensor:
+        """
+        Returns code usage histogram over the batch.
+        codes: (B, N)
+        """
+        hist = torch.bincount(codes.flatten(), minlength=self.K).float()
+        return hist
+    
     def forward(self, z: torch.Tensor):
         # z: (B, N, D)
         B, N, D = z.shape
@@ -304,11 +312,24 @@ class SegmentVQVAE(nn.Module):
             reduction="mean"
         )
 
-        total_loss = recon_loss + vq_loss
+        hist_i = self.vq_instru.code_usage_histogram(torch.cat([codes.view(B, -1) for codes in [c_i, p_i, n_i]], dim=1))
+        hist_v = self.vq_vocal.code_usage_histogram(torch.cat([codes.view(B, -1) for codes in [c_v, p_v, n_v]], dim=1))
+        hist = hist_i + hist_v
+        prob = hist / (hist.sum() + 1e-8)
+        entropy_loss = -(prob * torch.log(prob + 1e-8)).sum()
+
+        nce_loss = info_nce_loss(c_i) + info_nce_loss(c_v)
+        
+        gamma_ent = 0.25
+        lambda_nce = 0.1
+
+        total_loss = recon_loss + vq_loss + gamma_ent * entropy_loss + lambda_nce * nce_loss
 
         return total_loss, {
             "recon_loss": recon_loss.detach(),
             "vq_loss":    vq_loss.detach(),
+            "entropy":    entropy_loss.detach(),
+            "nce":        nce_loss.detach(),
             "total":      total_loss.detach(),
         }
     def train_ae(
@@ -362,6 +383,23 @@ class SegmentVQVAE(nn.Module):
 
 
 # ───────────────────────── utility ────────────────────────────
+def info_nce_loss(z: torch.Tensor, tau: float = 0.1) -> torch.Tensor:
+    """
+    z: (B, N, D)
+    Computes in-batch InfoNCE loss for latent continuity.
+    Positive: z[t+1], Negatives: other samples.
+    """
+    B, N, D = z.shape
+    z0 = z[:, :-1, :].reshape(-1, D)  # (B*(N-1), D)
+    z1 = z[:, 1:, :].reshape(-1, D)
+
+    z0 = F.normalize(z0, dim=-1)
+    z1 = F.normalize(z1, dim=-1)
+    sim = z0 @ z1.T  # (B*(N-1), B*(N-1))
+    labels = torch.arange(sim.size(0), device=z.device)
+    return F.cross_entropy(sim / tau, labels)
+
+
 def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
     """
     Split a (T, C) token grid into fixed-length segments, zero-padding the last.
