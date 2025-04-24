@@ -23,10 +23,9 @@ else:
 SEG_LEN = 256  # EnCodec time-steps per segment (~1.5 seconds)
 
 # ─────────────────────────── data prep ────────────────────────
-encoder = AudioEncoder(device=device, bandwidth = 6)
+encoder = AudioEncoder(device=device, sample_rate=24000, bandwidth = 6.0)
 tokens = encoder.encode("dataset/song_001/song_001.mp3")  # (T, C)
 tokens = tokens.to(device)
-
 segments = chunk_encodec_tokens(tokens, seg_len=SEG_LEN)  # list of (S, C)
 
 if len(segments) < 3:
@@ -45,16 +44,17 @@ C = tokens_prev.shape[-1]
 model = SegmentVQVAE(
     vocab_size=V,
     n_codebooks=C,
+    block_pairs=16,
     seg_len=SEG_LEN,
-    latent_dim=64,
-    emb_dim=64,
-    num_codes=128,
-    beta=0.01
+    latent_dim=128,
+    emb_dim=128,
+    num_codes=512,
+    beta=0.2
 ).to(device)
 
 
 # ─────────────────────────── training setup ───────────────────────────
-optimizer = torch.optim.Adam(model.parameters(), lr=4e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
 EPOCHS = 5000
 zero_second_prob = 0.0  # set to >0.0 if you want to experiment with partial mute
 start_epoch = 1
@@ -86,10 +86,19 @@ for epoch in range(start_epoch, EPOCHS + 1):
         batch_prev, batch_curr, batch_next = [x.to(device) for x in batch]
         # batch_prev, batch_curr, batch_next = (tokens_prev, tokens_curr, tokens_next)
         optimizer.zero_grad()
-        loss, metrics = model(
-            batch_prev, batch_curr, batch_next,
-            zero_second_prob=zero_second_prob,
-            variance_loss_scale=div_loss_scale
+        if epoch < 0:
+            loss, metrics = model.train_ae(
+                batch_prev, batch_curr, batch_next,
+                zero_second_prob=zero_second_prob,
+                variance_loss_scale=div_loss_scale,
+                use_vq = False if epoch < 500 else True
+        )
+        else:
+            loss, metrics = model(
+                batch_prev, batch_curr, batch_next,
+                zero_second_prob=zero_second_prob,
+                variance_loss_scale=div_loss_scale,
+                use_vq = False if epoch < 500 else True
         )
         loss.backward()
         optimizer.step()
@@ -108,14 +117,25 @@ for epoch in range(start_epoch, EPOCHS + 1):
     # avg_div = total_div / num_batches
     print(f"[Epoch {epoch:03d}] Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | VQ: {avg_vq:.4f}")
 
-    if epoch % 5000000 == 0 or epoch == EPOCHS:
+    if epoch % 50 == 0 or epoch == EPOCHS:
         # Sample one batch to measure code usage
-        # with torch.no_grad():
-            # _, code_ids, _ = model.vq(model.encoder(batch_curr))
-            # codes_used = code_ids.unique().numel()
-            # div_loss_scale = 0.01 * (1.0 - math.exp(-0.02 * (codes_used - 1)))
 
-        # print(f"🧱 Unique codes used: {codes_used} | div loss scale = {div_loss_scale:.4f}")
+        # assume batch_curr ∈ ℕ^{B×T×C}
+
+        with torch.no_grad():
+            # 1) run the CNN encoder → two latent streams (instr, vocal)
+            z_i, z_v = model.encoder(batch_curr)        # each ∈ ℝ^{B×n_latent_blocks×latent_dim}
+
+            # 2) quantize the instrumental stream
+            _, code_ids_i, _ = model.vq_instru(z_i)      # code_ids_i ∈ ℕ^{B×n_latent_blocks}
+            codes_used_i = code_ids_i.unique().numel()
+
+            # 3) (optionally) quantize the vocal stream
+            _, code_ids_v, _ = model.vq_vocal(z_v)       # code_ids_v ∈ ℕ^{B×n_latent_blocks}
+            codes_used_v = code_ids_v.unique().numel()
+
+        print(f"🧱 Instrumental codes used: {codes_used_i}, Vocal codes used: {codes_used_v}")
+
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),

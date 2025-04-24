@@ -14,40 +14,66 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ───────────────────────── quantiser ──────────────────────────
 class VectorQuantizer(nn.Module):
     """
-    Straight-through VQ layer (no EMA).
+    EMA-based VQ layer (drop-in replacement for the straight-through VectorQuantizer).
     """
-    def __init__(self, num_codes: int, dim: int, beta: float = 0.1):
+    def __init__(self, num_codes: int, dim: int, beta: float = 0.1,
+                 decay: float = 0.99, eps: float = 1e-5):
         super().__init__()
-        self.K, self.D, self.beta = num_codes, dim, beta
-        self.embed = nn.Embedding(num_codes, dim)
-        self.embed.weight.data.uniform_(-1 / num_codes, 1 / num_codes)
+        self.K = num_codes
+        self.D = dim
+        self.beta = beta
+        self.decay = decay
+        self.eps = eps
 
-    def forward(
-        self, z: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        z : (B, N, D)  latent grid
-        returns:
-          z_q_st : quantised with straight-through          (B, N, D)
-          codes  : code indices                             (B, N)
-          loss   : commitment loss (β · ‖z−sg(z_q)‖²)       ()
-        """
+        # Codebook embeddings
+        self.embed = nn.Embedding(self.K, self.D)
+        nn.init.uniform_(self.embed.weight, -1.0 / self.K, 1.0 / self.K)
+
+        # EMA buffers
+        self.register_buffer('ema_cluster_size', torch.zeros(self.K))
+        self.register_buffer('ema_w', self.embed.weight.data.clone())
+
+    def forward(self, z: torch.Tensor):
+        # z: (B, N, D)
         B, N, D = z.shape
-        flat = z.reshape(-1, D)                                              # (B·N, D)
-        dist = (
-            flat.pow(2).sum(1, keepdim=True)
-            - 2 * flat @ self.embed.weight.t()
-            + self.embed.weight.pow(2).sum(1)
-        )                                                                    # (B·N, K)
-        codes = dist.argmin(1)                                               # (B·N)
-        z_q = self.embed(codes).view(B, N, D)                                # (B, N, D)
+        flat_z = z.reshape(-1, D)  # (B*N, D)
 
-        commit = F.mse_loss(z, z_q.detach())
-        loss = self.beta * commit
+        # Compute distances to codebook
+        # dist: (B*N, K)
+        dist = (
+            flat_z.pow(2).sum(dim=1, keepdim=True)
+            - 2 * flat_z @ self.embed.weight.t()
+            + self.embed.weight.pow(2).sum(dim=1)
+        )
+        # Get codes
+        codes = dist.argmin(dim=1)  # (B*N,)
+        z_q = self.embed(codes).view(B, N, D)
+
+        # EMA codebook update
+        if self.training:
+            with torch.no_grad():
+                one_hot = F.one_hot(codes, self.K).type_as(flat_z)  # (B*N, K)
+                # Count and sums
+                cluster_size = one_hot.sum(dim=0)  # (K,)
+                dw = one_hot.t() @ flat_z          # (K, D)
+
+                # Update EMA variables
+                self.ema_cluster_size.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
+                self.ema_w.mul_(self.decay).add_(dw,           alpha=1 - self.decay)
+
+                # Laplace smoothing of the cluster size
+                n = self.ema_cluster_size + self.eps
+                # Normalize ema_w and update embedding weight
+                updated_weight = self.ema_w / n.unsqueeze(1)
+                self.embed.weight.data.copy_(updated_weight)
+
+        # Commitment loss
+        commit_loss = F.mse_loss(z, z_q.detach())
+        loss = self.beta * commit_loss
+
+        # Straight-through estimator
         z_q_st = z + (z_q - z).detach()
         return z_q_st, codes.view(B, N), loss
 
@@ -91,6 +117,21 @@ class ConvSegmentEncoder(nn.Module):
 
 
 # ───────────────────── transformer decoder ────────────────────
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=4):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.r            = r
+
+        # Learnable low-rank adapters only
+        self.A = nn.Parameter(torch.randn(r, in_features) * 0.01)
+        self.B = nn.Parameter(torch.randn(out_features, r) * 0.01)
+
+    def forward(self, x):
+        # x: [B, N, in_features]
+        return (x @ self.A.T) @ self.B.T
+
 class TransformerSegmentDecoder(nn.Module):
     """
     Takes SIX quantised streams (prev/cur/next × instru/vocal) and
@@ -115,8 +156,11 @@ class TransformerSegmentDecoder(nn.Module):
         enc_layer = nn.TransformerEncoderLayer(d_model, nhead=4, dim_feedforward=512)
         self.tf = nn.TransformerEncoder(enc_layer, num_layers=1)
 
-        self.proj = nn.Linear(6 * n_latent_blocks * d_model,
-                              seg_len * n_codebooks * vocab_size)
+        self.proj = LoRALinear(
+            in_features  = 6 * n_latent_blocks * d_model,
+            out_features = seg_len * n_codebooks * vocab_size,
+            r = 8
+        )
 
     def forward(
         self,
@@ -151,7 +195,7 @@ class SegmentVQVAE(nn.Module):
         vocab_size: int,
         n_codebooks: int,
         seg_len: int,
-        block_pairs: int = 2,
+        block_pairs: int = 4,
         num_codes: int = 512,
         emb_dim: int = 128,
         latent_dim: int = 128,
@@ -179,6 +223,7 @@ class SegmentVQVAE(nn.Module):
         tokens_curr: torch.Tensor,
         tokens_next: torch.Tensor,
         *,
+        use_vq: bool = True,
         zero_second_prob: float = 0.0,
         variance_loss_scale: float = 0.0
     ) -> Tuple[torch.Tensor, dict]:
@@ -189,24 +234,39 @@ class SegmentVQVAE(nn.Module):
         c_i, c_v = self.encoder(tokens_curr)
         n_i, n_v = self.encoder(tokens_next)
 
-        # quantise
-        p_i_q, _, vq_pi = self.vq_instru(p_i)
-        c_i_q, _, vq_ci = self.vq_instru(c_i)
-        n_i_q, _, vq_ni = self.vq_instru(n_i)
+        if use_vq:
+            # Quantize normally
+            p_i_q, _, vq_pi = self.vq_instru(p_i)
+            c_i_q, _, vq_ci = self.vq_instru(c_i)
+            n_i_q, _, vq_ni = self.vq_instru(n_i)
 
-        p_v_q, _, vq_pv = self.vq_vocal(p_v)
-        c_v_q, _, vq_cv = self.vq_vocal(c_v)
-        n_v_q, _, vq_nv = self.vq_vocal(n_v)
+            p_v_q, _, vq_pv = self.vq_vocal(p_v)
+            c_v_q, _, vq_cv = self.vq_vocal(c_v)
+            n_v_q, _, vq_nv = self.vq_vocal(n_v)
 
-        # optional vocal drop on current segment
-        if self.training and zero_second_prob and torch.rand(()) < zero_second_prob:
-            c_v_q = torch.zeros_like(c_v_q)
+            vq_loss = vq_pi + vq_ci + vq_ni + vq_pv + vq_cv + vq_nv
+        else:
+            # 🔥 Warm-up: bypass quantization, use embedding directly
+            with torch.no_grad():
+                B, N, D = c_i.shape
+                rand_idx_i = torch.randint(0, self.vq_instru.K, size=(B, N), device=c_i.device)
+                rand_idx_v = torch.randint(0, self.vq_vocal.K, size=(B, N), device=c_i.device)
+
+            p_i_q = self.vq_instru.embed(rand_idx_i)
+            c_i_q = self.vq_instru.embed(rand_idx_i)
+            n_i_q = self.vq_instru.embed(rand_idx_i)
+
+            p_v_q = self.vq_vocal.embed(rand_idx_v)
+            c_v_q = self.vq_vocal.embed(rand_idx_v)
+            n_v_q = self.vq_vocal.embed(rand_idx_v)
+
+            vq_loss = torch.tensor(0.0, device=c_i.device)
 
         logits = self.decoder(
             p_i_q, p_v_q,
             c_i_q, c_v_q,
             n_i_q, n_v_q
-        )  # (B, T, C, V)
+        )
 
         recon_loss = F.cross_entropy(
             logits.reshape(B * T * C, self.vocab_size),
@@ -214,7 +274,6 @@ class SegmentVQVAE(nn.Module):
             reduction="mean"
         )
 
-        vq_loss = vq_pi + vq_ci + vq_ni + vq_pv + vq_cv + vq_nv
         total_loss = recon_loss + vq_loss
 
         return total_loss, {
@@ -222,6 +281,54 @@ class SegmentVQVAE(nn.Module):
             "vq_loss":    vq_loss.detach(),
             "total":      total_loss.detach(),
         }
+    def train_ae(
+        self,
+        tokens_prev: torch.Tensor,
+        tokens_curr: torch.Tensor,
+        tokens_next: torch.Tensor,
+        *,
+        use_vq: bool = True,  # still accepts flag, but ignored here
+        zero_second_prob: float = 0.0,
+        variance_loss_scale: float = 0.0
+    ) -> Tuple[torch.Tensor, dict]:
+        B, T, C = tokens_curr.shape
+
+        # --- encode three segments directly ---
+        p_i, p_v = self.encoder(tokens_prev)
+        c_i, c_v = self.encoder(tokens_curr)
+        n_i, n_v = self.encoder(tokens_next)
+
+        # 🔁 skip VQ, use encoder output directly
+        p_i_q = p_i
+        c_i_q = c_i
+        n_i_q = n_i
+
+        p_v_q = p_v
+        c_v_q = c_v
+        n_v_q = n_v
+
+        # --- decode ---
+        logits = self.decoder(
+            p_i_q, p_v_q,
+            c_i_q, c_v_q,
+            n_i_q, n_v_q
+        )  # (B, T, C, V)
+
+        # --- compute reconstruction loss only ---
+        recon_loss = F.cross_entropy(
+            logits.reshape(B * T * C, self.vocab_size),
+            tokens_curr.reshape(B * T * C).long(),
+            reduction="mean"
+        )
+
+        total_loss = recon_loss
+
+        return total_loss, {
+            "recon_loss": recon_loss.detach(),
+            "vq_loss":    torch.tensor(0.0, device=logits.device),
+            "total":      total_loss.detach(),
+        }
+
 
 
 # ───────────────────────── utility ────────────────────────────

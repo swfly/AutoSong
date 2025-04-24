@@ -5,13 +5,18 @@ import torchaudio
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 class AudioEncoder:
-    def __init__(self, device="cuda", sample_rate=24000, bandwidth=1.5):
+    def __init__(self, device="cuda", sample_rate=48000, bandwidth=1.5):
+        if sample_rate == 48000:
+            self.model = EncodecModel.encodec_model_48khz()
+        elif sample_rate == 24000:
+            self.model = EncodecModel.encodec_model_24khz()
+        else:
+            raise Exception("unsupported sampling rate")
         self.device = device
-        self.model = EncodecModel.encodec_model_24khz()
         self.model.set_target_bandwidth(bandwidth)
         self.model.eval().to(self.device)
         self.sample_rate = sample_rate
-        self.channels = self.model.channels  # Number of codebooks (quantizers)
+        self.channels = self.model.channels  # Number of channels for the model (quantizers)
         
         # Access the codebook and determine the vocabulary size
         try:
@@ -38,7 +43,6 @@ class AudioEncoder:
 
         with torch.no_grad():
             encoded_frames = self.model.encode(wav)
-
         # encoded_frames is a list of length C (num codebooks)
         # each element is (B, 1, T) → we squeeze batch and stack as (C, T)
         codebooks = encoded_frames[0][0]  # Shape: (1, C, T)
