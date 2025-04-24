@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+# ───────────────────────── quantiser ──────────────────────────
 class VectorQuantizer(nn.Module):
     """
     EMA-based VQ layer (drop-in replacement for the straight-through VectorQuantizer).
@@ -29,7 +31,7 @@ class VectorQuantizer(nn.Module):
 
         # Codebook embeddings
         self.embed = nn.Embedding(self.K, self.D)
-        nn.init.uniform_(self.embed.weight, -1.0 / self.K, 1.0 / self.K)
+        nn.init.uniform_(self.embed.weight, -1.0, 1.0)
 
         # EMA buffers
         self.register_buffer('ema_cluster_size', torch.zeros(self.K))
@@ -77,12 +79,36 @@ class VectorQuantizer(nn.Module):
         z_q_st = z + (z_q - z).detach()
         return z_q_st, codes.view(B, N), loss
 
-
 # ───────────────────────── CNN encoder ────────────────────────
-class ConvSegmentEncoder(nn.Module):
+class _DWConvBlock(nn.Module):
     """
-    Lightweight local encoder: tokens → (z_instru , z_vocal)
-                               shape : (B, N, D) each
+    Depth-wise separable 1-D conv (+ GLU) with residual & GroupNorm.
+    """
+    def __init__(self, chan_in: int, chan_mid: int):
+        super().__init__()
+        # depth-wise conv
+        self.dw = nn.Conv1d(chan_in, chan_in, kernel_size=3,
+                            padding=1, groups=chan_in, bias=False)
+        # point-wise projection – doubled for GLU
+        self.pw = nn.Conv1d(chan_in, 2 * chan_mid, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(1, chan_mid)          # channel-wise LayerNorm
+        self.act  = nn.SiLU()                          # Swish
+        # residual adapter in case of channel mismatch
+        self.skip = (nn.Conv1d(chan_in, chan_mid, 1, bias=False)
+                     if chan_in != chan_mid else nn.Identity())
+
+    def forward(self, x):                              # x: (B, C, T)
+        residual = self.skip(x)
+        x = self.dw(x)
+        x = self.pw(x)
+        x, gate = x.chunk(2, dim=1)                    # GLU
+        x = x * torch.sigmoid(gate)
+        x = self.norm(x + residual)
+        return self.act(x)
+
+class LightweightSegmentEncoder(nn.Module):
+    """
+    Tiny CNN → latent grid  (B, N_blocks, 2·latent_dim)  then split streams.
     """
     def __init__(
         self,
@@ -94,27 +120,31 @@ class ConvSegmentEncoder(nn.Module):
     ):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, emb_dim)
-        in_dim = emb_dim * n_codebooks
-        hid = latent_dim * 4
 
-        self.conv_feat = nn.Sequential(
-            nn.Conv1d(in_dim, hid, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(hid, 2 * latent_dim, 1),  # → 2D channels
-            nn.ReLU(),
+        chan_in  = emb_dim * n_codebooks       # concat codebook token-embs
+        chan_mid = latent_dim * 2              # modest width
+        chan_out = latent_dim * 2              # final channels before split
+
+        self.backbone = nn.Sequential(
+            _DWConvBlock(chan_in,  chan_mid),
+            _DWConvBlock(chan_mid, chan_mid),
+            _DWConvBlock(chan_mid, chan_out),
         )
+
+        # global average-pool to fixed latent grid (N_blocks)
         self.pool = nn.AdaptiveAvgPool1d(n_latent_blocks)
 
-    def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # ───────────────────────────────────────────────────────────────────
+    def forward(self, tokens: torch.Tensor):
         """
-        tokens : (B, 256, C)
+        tokens: (B, T_seg, C_codebooks)
+        returns: (z_instr, z_vocal) -- each (B, N_blocks, latent_dim)
         """
         B, T, C = tokens.shape
-        x = self.emb(tokens).view(B, T, -1).transpose(1, 2)   # (B, C·emb , T)
-        x = self.conv_feat(x)                                 # (B, 2D , T)
-        x = self.pool(x).transpose(1, 2)                      # (B, N , 2D)
-        return x.chunk(2, dim=-1)                             # (B,N,D) ×2
-
+        x = self.emb(tokens).view(B, T, -1).transpose(1, 2)  # (B, C′, T)
+        x = self.backbone(x)                                 # (B, 2·D, T)
+        x = self.pool(x).transpose(1, 2)                     # (B, N, 2·D)
+        return x.chunk(2, dim=-1)                            # instru / vocal
 
 # ───────────────────── transformer decoder ────────────────────
 class LoRALinear(nn.Module):
@@ -206,7 +236,7 @@ class SegmentVQVAE(nn.Module):
         self.vocab_size = vocab_size
         self.n_codebooks = n_codebooks
 
-        self.encoder = ConvSegmentEncoder(
+        self.encoder = LightweightSegmentEncoder(
             vocab_size, n_codebooks, emb_dim, latent_dim, block_pairs
         )
         self.vq_instru = VectorQuantizer(num_codes, latent_dim, beta)

@@ -10,14 +10,18 @@ from models.vq_vae import SegmentVQVAE, chunk_encodec_tokens
 from models.audio_encoder import AudioEncoder
 
 # ─────────────────────────── config ───────────────────────────
-DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = (
+    torch.device("cuda") if torch.cuda.is_available()
+    else torch.device("mps") if torch.backends.mps.is_available()
+    else torch.device("cpu")
+)
 AUDIO_IN      = "dataset/song_001/song_001.mp3"
-CHECKPOINT    = "checkpoints/vqvae_overfit.pt"
+CHECKPOINT = "checkpoints/vqvae_dataset.pt"
 SEG_LEN       = 256  # EnCodec frames per segment
 OUTPUT_WAV    = "reconstructed_vqvae.wav"
 
 # ─────────────────────────── load audio encoder ────────────────
-audio_encoder = AudioEncoder(device=DEVICE, bandwidth=6)
+audio_encoder = AudioEncoder(device=DEVICE, sample_rate=24000, bandwidth=6.0)
 tokens = audio_encoder.encode(AUDIO_IN).to(DEVICE)  # (T_full, C)
 T_full, C = tokens.shape
 
@@ -28,13 +32,14 @@ num_segs = len(segments)
 # ─────────────────────────── load model ─────────────────────────
 # instantiate VQ-VAE
 V = audio_encoder.vocab_size
+VOCAB_SIZE = audio_encoder.vocab_size
 model = SegmentVQVAE(
-    vocab_size=V,
+    vocab_size=VOCAB_SIZE,
     n_codebooks=C,
-    seg_len=SEG_LEN,
     block_pairs=16,
-    emb_dim=128,
-    latent_dim=128,
+    seg_len=SEG_LEN,
+    latent_dim=256,
+    emb_dim=256,
     num_codes=512,
     beta=0.2
 ).to(DEVICE)
