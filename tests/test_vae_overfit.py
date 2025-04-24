@@ -46,14 +46,15 @@ model = SegmentVQVAE(
     vocab_size=V,
     n_codebooks=C,
     seg_len=SEG_LEN,
-    latent_dim=128,
+    latent_dim=64,
+    emb_dim=64,
     num_codes=128,
-    beta=0.5
+    beta=0.01
 ).to(device)
 
 
 # ─────────────────────────── training setup ───────────────────────────
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=4e-4)
 EPOCHS = 5000
 zero_second_prob = 0.0  # set to >0.0 if you want to experiment with partial mute
 start_epoch = 1
@@ -96,7 +97,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         total_loss    += loss.item()
         total_recon   += metrics["recon_loss"].item()
         total_vq      += metrics["vq_loss"].item()
-        total_div     += metrics["diversity_loss"].item()
+        # total_div     += metrics["diversity_loss"].item()
 
 
     # Average metrics per epoch
@@ -104,10 +105,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
     avg_loss  = total_loss / num_batches
     avg_recon = total_recon / num_batches
     avg_vq    = total_vq / num_batches
-    avg_div = total_div / num_batches
-    print(f"[Epoch {epoch:03d}] Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | VQ: {avg_vq:.4f} | DIV: {avg_div:.4f}")
+    # avg_div = total_div / num_batches
+    print(f"[Epoch {epoch:03d}] Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | VQ: {avg_vq:.4f}")
 
-    if epoch % 50 == 0 or epoch == EPOCHS:
+    if epoch % 5000000 == 0 or epoch == EPOCHS:
         # Sample one batch to measure code usage
         # with torch.no_grad():
             # _, code_ids, _ = model.vq(model.encoder(batch_curr))
