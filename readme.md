@@ -315,11 +315,74 @@ This hierarchical factorization addresses multiple limitations of the earlier fl
 
 ---
 
-### 🔄 Training Strategy
+## 🔄 Discrete Transformer Autoencoder (Gumbel-Softmax Bottleneck)
 
-- **VQ-VAE** is trained first in isolation using a reconstruction objective over EnCodec tokens.
-- The **AR Transformer** is then trained over sequences of VQ latents.
-- Final system can be fine-tuned jointly or kept modular depending on compute constraints.
+This variant replaces the unstable VQ bottleneck with a **fully differentiable Transformer-based autoencoder**, using **discrete token prediction** as the compression mechanism.
+
+Instead of learning a quantized latent codebook, the encoder outputs a **distribution over vocabulary tokens**, and the representation is obtained via **Gumbel-Softmax sampling** during training:
+
+---
+
+### 📥 Encoder (Transformer)
+
+- **Input**: EnCodec tokens `x ∈ ℕ^{T × C}` (T time steps, C codebooks)
+- **Embedding**: Token + Channel + Position
+- **Core**: Transformer Encoder
+- **Output**: `logits ∈ ℝ^{T × C × V}` (per-channel vocabulary logits)
+
+During training, apply **Gumbel-Softmax** for differentiable sampling:
+
+\[
+\mathbf{z}_{t,c} = \text{GumbelSoftmax}(\text{logits}_{t,c}, \tau, \text{hard=True})
+\]
+
+At inference time, use `argmax(logits)` for hard token extraction.
+
+---
+
+### 📤 Decoder (Transformer)
+
+- **Input**: Discrete token sequence `z ∈ ℕ^{T × C}` from encoder (argmax or Gumbel)
+- **Embedding**: Same as encoder
+- **Core**: Transformer Decoder
+- **Output**: `\hat{x} ∈ ℝ^{T × C × V}`
+
+---
+
+### 🧪 Training Objective
+
+- **Reconstruction Loss**:
+  \[
+  \mathcal{L}_{\text{recon}} = \text{CrossEntropy}(\hat{x}, x)
+  \]
+
+- **Optional Entropy Regularization**:
+  Encourage diverse token usage across sequences:
+  \[
+  \mathcal{L}_{\text{entropy}} = -\sum p \log p \quad \text{(avg over batch)}
+  \]
+
+- **Final Loss**:
+  \[
+  \mathcal{L} = \mathcal{L}_{\text{recon}} + \lambda_{\text{entropy}} \cdot \mathcal{L}_{\text{entropy}}
+  \]
+
+---
+
+### 🧠 Advantages of This Design
+
+- ✅ Fully differentiable: avoids VQ backprop issues
+- ✅ No codebook collapse or dead entries
+- ✅ Easier to train and scale
+- ✅ Integrates smoothly with autoregressive generation pipelines
+
+---
+
+### 🛠 Notes
+
+- Gumbel-Softmax temperature `τ` can be annealed during training for sharper distributions.
+- This is **not a VAE** and doesn't rely on latent priors — it's a **discrete bottleneck autoencoder** purely optimized via reconstruction.
+
 
 ---
 

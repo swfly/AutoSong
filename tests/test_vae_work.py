@@ -15,7 +15,7 @@ DEVICE = (
     else torch.device("mps") if torch.backends.mps.is_available()
     else torch.device("cpu")
 )
-AUDIO_IN      = "dataset/song_001/song_001.mp3"
+AUDIO_IN      = "dataset/song_0001/song_001.mp3"
 CHECKPOINT = "checkpoints/vqvae_dataset.pt"
 SEG_LEN       = 256  # EnCodec frames per segment
 OUTPUT_WAV    = "reconstructed_vqvae.wav"
@@ -39,9 +39,7 @@ model = SegmentVQVAE(
     block_pairs=16,
     seg_len=SEG_LEN,
     latent_dim=256,
-    emb_dim=256,
-    num_codes=512,
-    beta=0.2
+    emb_dim=256
 ).to(DEVICE)
 
 # load checkpoint
@@ -68,19 +66,12 @@ with torch.no_grad():
         c_i, c_v = model.encoder(curr)
         n_i, n_v = model.encoder(nxt)
 
-        p_i_q, _, _ = model.vq_instru(p_i)
-        c_i_q, _, _ = model.vq_instru(c_i)
-        n_i_q, _, _ = model.vq_instru(n_i)
-
-        p_v_q, _, _ = model.vq_vocal(p_v)
-        c_v_q, _, _ = model.vq_vocal(c_v)
-        n_v_q, _, _ = model.vq_vocal(n_v)
 
         # decode logits
         logits = model.decoder(
-            p_i_q, p_v_q,
-            c_i_q, c_v_q,
-            n_i_q, n_v_q
+            p_i, p_v,
+            c_i, c_v,
+            n_i, n_v
         )  # [1, SEG_LEN, C, V]
 
         # take argmax over vocab to get token IDs
