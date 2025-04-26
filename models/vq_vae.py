@@ -1,197 +1,279 @@
+from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import List, Tuple
-import math
-# -------------------------------------------------------------------
-# Discrete Transformer Autoencoder for EnCodec tokens
-# -------------------------------------------------------------------
+def assert_finite(t, name):
+    if torch.isnan(t).any() or torch.isinf(t).any():
+        raise RuntimeError(f"{name} contains NaN/Inf")
+# -----------------------------------------------------------------------------
+#  LoRA utility (optional – not used inside the AE, but provided for extension)
+# -----------------------------------------------------------------------------
+class LoRALinear(nn.Module):
+    """Low-rank adaptation layer:  ΔW = B·A  (rank *r*)."""
 
+    def __init__(self, in_features: int, out_features: int, r: int = 4):
+        super().__init__()
+        self.A = nn.Parameter(torch.randn(r, in_features) * 0.01)
+        self.B = nn.Parameter(torch.randn(out_features, r) * 0.01)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, N, in]
+        return x @ (self.A.t() @ self.B.t())
+
+# -----------------------------------------------------------------------------
+#  Encoder
+# -----------------------------------------------------------------------------
 class DiscreteEncoder(nn.Module):
+    """Map *EnCodec* tokens → distribution over latent codes of length *L*.
+
+    Input : tokens          [B, T, C]
+    Output: latent logits   [B, L, C, latent_vocab_size]
     """
-    Transformer-based encoder that maps discrete audio tokens to logits over token vocab.
-    Input: tokens [B, T, C]
-    Output: logits [B, T, C, V]
-    """
+
     def __init__(
         self,
         vocab_size: int,
         n_codebooks: int,
+        seq_len: int,                  # maximum input T
+        latent_seq_len: int,           # desired latent length L
+        latent_vocab_size: int = 512,
+        embed_dim: int = 512,
+        latent_dim: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.latent_seq_len = latent_seq_len
+        self.latent_vocab_size = latent_vocab_size
+        self.n_codebooks = n_codebooks
+        D_e, D_l = embed_dim, latent_dim
+
+        # token / channel / position embeddings
+        self.token_emb   = nn.Embedding(vocab_size, D_e)
+        self.channel_emb = nn.Embedding(n_codebooks, D_e)
+        self.pos_emb     = nn.Parameter(torch.randn(1, seq_len, D_e) * 0.02)
+
+        self.in_proj = nn.Linear(D_e, D_l) if D_e != D_l else nn.Identity()
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=D_l,
+            nhead=num_heads,
+            dim_feedforward=4 * D_l,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.tfm = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        self.out_proj = nn.Linear(D_l, latent_vocab_size)
+
+    # ---------------------------------------------------------------------
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:  # [B,T,C]
+        B, T, C = tokens.shape
+        assert C == self.n_codebooks, "C does not match n_codebooks"
+
+        # Embedding + positional & channel encodings ––> [B, T, C, D_e]
+        x = self.token_emb(tokens.view(B, T * C)).view(B, T, C, -1)
+        ch = self.channel_emb(torch.arange(C, device=tokens.device)).view(1, 1, C, -1)
+        pos = self.pos_emb[:, :T, :].unsqueeze(2)
+        x = x + ch + pos
+
+        # [B, T*C, D_e] → project → Transformer
+        x = self.in_proj(x.view(B, T * C, -1))      # [B, T*C, D_l]
+        x = self.tfm(x)                             # [B, T*C, D_l]
+        
+        # project [T*C, D_l] to [L_l, D_l] via pooling
+        # x: [B, T*C, D_l]
+        x = x.permute(0, 2, 1)  # [B, D_l, T*C]
+        # Downsample sequence: T*C -> L_l
+        x = F.adaptive_avg_pool1d(x, output_size=self.latent_seq_len) 
+        x = x.permute(0, 2, 1) 
+
+        # Project to distribution
+        logits = self.out_proj(x)            # [B, L_l, V_l]
+        return logits
+
+# -----------------------------------------------------------------------------
+#  Decoder
+# -----------------------------------------------------------------------------
+class DiscreteDecoder(nn.Module):
+    """Reconstruct original tokens from latent codes.
+
+    latent tokens:  [B, L, C] or embedded [B, L, C, D_e]
+    output logits : [B, T, C, vocab_size]
+    """
+
+    def __init__(
+        self,
+        latent_vocab_size: int,
+        latent_len: int,
+        output_token_vocab_size: int,
+        n_codebooks: int,
+        target_seq_len: int,   # original T (for up-sampling)
         embed_dim: int = 512,
         num_layers: int = 4,
         num_heads: int = 8,
         dropout: float = 0.1,
-        max_seq_len: int = 8192,
-    ):
+    ) -> None:
         super().__init__()
-        self.vocab_size = vocab_size
+        self.decode_segment_len = target_seq_len
         self.n_codebooks = n_codebooks
         self.embed_dim = embed_dim
-
-        # token, channel, position embeddings
-        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+        self.latent_emb  = nn.Embedding(latent_vocab_size, embed_dim)
+        self.pos_emb_lat = nn.Parameter(torch.randn(1, latent_len, embed_dim) * 0.02)
         self.channel_emb = nn.Embedding(n_codebooks, embed_dim)
-        self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))
+        dec_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=4 * embed_dim,
+            dropout=dropout,
+            batch_first=True,
+        )
+        # Simpler: share architecture with encoder; we *upsample* latents beforehand
+        self.tfm = nn.TransformerEncoder(dec_layer, num_layers=num_layers)
 
-        # Transformer encoder layers
-        layers = []
-        for _ in range(num_layers):
-            layers.append(nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=4*embed_dim,
-                dropout=dropout,
-                batch_first=True,
-            ))
-        self.encoder = nn.TransformerEncoder(nn.Sequential(*layers), num_layers=num_layers)
+        self.out_proj = nn.Linear(embed_dim, output_token_vocab_size)
 
-        # output projection to logits
-        self.out_proj = nn.Linear(embed_dim, vocab_size)
+    def straight_through_softmax(self, logits, tau=1.0):
+        # Soft sample
+        soft = F.softmax(logits / tau, dim=-1)
+        # Hard sample
+        index = soft.argmax(dim=-1, keepdim=True)
+        hard = torch.zeros_like(logits).scatter_(-1, index, 1.0)
+        # Straight-through
+        return hard + soft - hard.detach()
+    # full discrete path -------------------------------------------------
+    def forward_soft_embedding(self, z_logits): #[B, L_l, V_l] token sequence, no channel
+        B, L_l, V = z_logits.shape
+        D = self.embed_dim
+        C = self.n_codebooks
+        T = self.decode_segment_len
+        # 1. Soft-Embed latent tokens
+        #z_soft = F.softmax(z_logits, dim=-1)  # [B, L_l, V]
+        z_soft = self.straight_through_softmax(z_logits)
+        z_emb = torch.einsum('blv,vd->bld', z_soft, self.latent_emb.weight)  # [B, L_l, D]
+        # 2. Add latent positional embedding
+        pos_lat = self.pos_emb_lat[:, :L_l, :]  # [1, L_l, D]
+        z_emb = z_emb + pos_lat  # [B, L_l, D]
+        z_emb = z_emb.unsqueeze(2).expand(-1, -1, C, -1)  # [B, L_l, C, D]
+        # 4. Add channel embedding
+        ch_emb = self.channel_emb(torch.arange(C, device=z_logits.device)).view(1, 1, C, D)
+        z_emb = z_emb + ch_emb  # [B, L_l, C, D]
+        # 5. Upsample L_l → T
+        z_emb = z_emb.permute(0, 2, 3, 1)  # [B, C, D, L_l]
+        z_emb = z_emb.reshape(B * C, D, L_l)  # [B*C, D, L_l]
+        z_emb = F.interpolate(z_emb, size=T, mode="nearest")  # [B*C, D, T]
+        z_emb = z_emb.view(B, C, D, T).permute(0, 3, 1, 2)  # [B, T, C, D]
+        z_emb = z_emb.reshape(B, T * C, D)  # [B, T*C, D]
+        x = self.tfm(z_emb)  # [B, T*C, D]
+        # 9. Reshape back
+        x = x.view(B, T, C, D)  # [B, T, C, D]
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        # tokens: [B, T, C]
-        B, T, C = tokens.shape
-        # embed tokens
-        x = self.token_emb(tokens.view(B, T*C))  # [B, T*C, D]
-        x = x.view(B, T, C, self.embed_dim)
-        # add channel+position
-        ch = self.channel_emb(torch.arange(C, device=tokens.device))  # [C, D]
-        ch = ch.unsqueeze(0).unsqueeze(0)  # [1,1,C,D]
-        ps = self.pos_emb[:, :T, :].unsqueeze(2)  # [1,T,1,D]
-        x = x + ch + ps
-        # flatten channels into sequence
-        x = x.view(B, T*C, self.embed_dim)
-        # encode
-        x = self.encoder(x)  # [B, T*C, D]
-        # project to logits
-        logits = self.out_proj(x)  # [B, T*C, V]
-        logits = logits.view(B, T, C, self.vocab_size)
+        # 10. Output projection per codebook
+        logits = self.out_proj(x)  # [B, T, C, vocab_size]
         return logits
 
-class DiscreteDecoder(nn.Module):
-    """
-    Transformer-based decoder that reconstructs input tokens from discrete codes.
-    Input: discrete tokens z [B, T, C]
-    Output: logits [B, T, C, V]
-    """
+    def forward(self, z_tokens: torch.Tensor) -> torch.Tensor:  # [B,L_l]
+        B, L_l = z_tokens.shape
+        D = self.embed_dim
+        C = self.n_codebooks
+        T = self.decode_segment_len
+
+        # 1. Embed latent tokens
+        z_emb = self.latent_emb(z_tokens)  # [B, L_l, D]
+        # 2. Add latent positional embedding
+        pos_lat = self.pos_emb_lat[:, :L_l, :]  # [1, L_l, D]
+        z_emb = z_emb + pos_lat  # [B, L_l, D]
+        z_emb = z_emb.unsqueeze(2).expand(-1, -1, C, -1)  # [B, L_l, C, D]
+        # 4. Add channel embedding
+        ch_emb = self.channel_emb(torch.arange(C, device=z_tokens.device)).view(1, 1, C, D)
+        z_emb = z_emb + ch_emb  # [B, L_l, C, D]
+        # 5. Upsample L_l → T
+        z_emb = z_emb.permute(0, 2, 3, 1)  # [B, C, D, L_l]
+        z_emb = z_emb.reshape(B * C, D, L_l)  # [B*C, D, L_l]
+        z_emb = F.interpolate(z_emb, size=T, mode="nearest")  # [B*C, D, T]
+        z_emb = z_emb.view(B, C, D, T).permute(0, 3, 1, 2)  # [B, T, C, D]
+        z_emb = z_emb.reshape(B, T * C, D)  # [B, T*C, D]
+        x = self.tfm(z_emb)  # [B, T*C, D]
+        # 9. Reshape back
+        x = x.view(B, T, C, D)  # [B, T, C, D]
+
+        # 10. Output projection per codebook
+        logits = self.out_proj(x)  # [B, T, C, vocab_size]
+        return logits
+
+# -----------------------------------------------------------------------------
+#  Auto-encoder wrapper
+# -----------------------------------------------------------------------------
+class TransformerAutoencoder(nn.Module):
+    """Encode → sample → decode."""
+
     def __init__(
         self,
-        vocab_size: int,
+        *,
+        input_token_vocab_size: int,
         n_codebooks: int,
+        segment_length: int,          # maximum input T
+        latent_seq_len: int,          # compressed length L
+        latent_vocab_size: int = 512,
         embed_dim: int = 512,
+        latent_dim: int = 256,
         num_layers: int = 4,
         num_heads: int = 8,
         dropout: float = 0.1,
-        max_seq_len: int = 8192,
-    ):
+    ) -> None:
         super().__init__()
-        # similar embedding setup
-        self.vocab_size = vocab_size
-        self.n_codebooks = n_codebooks
-        self.token_emb = nn.Embedding(vocab_size, embed_dim)
-        self.channel_emb = nn.Embedding(n_codebooks, embed_dim)
-        self.pos_emb = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))
 
-        # Transformer decoder layers
-        layers = []
-        for _ in range(num_layers):
-            layers.append(nn.TransformerDecoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=4*embed_dim,
-                dropout=dropout,
-                batch_first=True,
-            ))
-        self.decoder = nn.TransformerDecoder(nn.Sequential(*layers), num_layers=num_layers)
+        # encoder
+        self.encoder = DiscreteEncoder(
+            vocab_size=input_token_vocab_size,
+            n_codebooks=n_codebooks,
+            seq_len=segment_length,
+            latent_seq_len=latent_seq_len,
+            latent_vocab_size=latent_vocab_size,
+            embed_dim=embed_dim,
+            latent_dim=latent_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
 
-        # final projection
-        self.out_proj = nn.Linear(embed_dim, vocab_size)
-
-    def forward_embedded(self, z_emb: torch.Tensor) -> torch.Tensor:
-        """
-        z_emb: [B, T, C, D] — pre-embedded latent tokens
-        returns logits [B, T, C, V]
-        """
-        B, T, C, D = z_emb.shape
-        ch = self.channel_emb(torch.arange(C, device=z_emb.device)).unsqueeze(0).unsqueeze(0)  # [1,1,C,D]
-        ps = self.pos_emb[:, :T, :].unsqueeze(2)  # [1,T,1,D]
-        x = z_emb + ch + ps
-        x = x.view(B, T*C, D)
-
-        mask = torch.triu(torch.full((T*C, T*C), float('-inf'), device=x.device), diagonal=1)
-        x = self.decoder(x, x, tgt_mask=mask)
-        logits = self.out_proj(x).view(B, T, C, self.vocab_size)
-        return logits
-    def forward(self, z_tokens: torch.Tensor) -> torch.Tensor:
-        # z_tokens: [B, T, C]
-        B, T, C = z_tokens.shape
-        # embed input tokens
-        x = self.token_emb(z_tokens.view(B, T*C))
-        x = x.view(B, T, C, -1)
-        # add embeddings
-        ch = self.channel_emb(torch.arange(C, device=z_tokens.device))  # [C, D]
-        ch = ch.unsqueeze(0).unsqueeze(0)
-        ps = self.pos_emb[:, :T, :].unsqueeze(2)
-        x = x + ch + ps
-        # flatten and prepare causal mask
-        x = x.view(B, T*C, -1)
-        # causal mask
-        mask = torch.triu(torch.full((T*C, T*C), float('-inf'), device=x.device), diagonal=1)
-        # decode
-        x = self.decoder(x, x, tgt_mask=mask)
-        logits = self.out_proj(x)
-        logits = logits.view(B, T, C, self.vocab_size)
-        return logits
-
-class TransformerAutoencoder(nn.Module):
-    """
-    Discrete Transformer Autoencoder.
-    encode -> argmax -> decode
-    """
-    def __init__(self, vocab_size, n_codebooks, **kwargs):
-        super().__init__()
-        self.encoder = DiscreteEncoder(vocab_size, n_codebooks, **kwargs)
-        self.decoder = DiscreteDecoder(vocab_size, n_codebooks, **kwargs)
-
+        # decoder
+        self.decoder = DiscreteDecoder(
+            latent_vocab_size=latent_vocab_size,
+            latent_len=latent_seq_len,
+            output_token_vocab_size=input_token_vocab_size,
+            n_codebooks=n_codebooks,
+            target_seq_len=segment_length,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+    # ------------------------------------------------------------------
+    def _gumbel_soft(self, logits: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+        g = -torch.empty_like(logits).exponential_().log() + 1e-8  # Gumbel(0,1)
+        return F.softmax((logits + g) / tau, dim=-1)
+    def gumbel_sample(self,logits, tau=1.0):
+        eps = 1e-20
+        noise = -torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
+        return F.softmax((logits + noise) / tau, dim=-1)
+    # ------------------------------------------------------------------
     def forward(self, tokens: torch.Tensor) -> dict:
-        # tokens: [B, T, C]
-        enc_logits = self.encoder(tokens)  # [B, T, C, V]
-        # discrete bottleneck
-        def gumbel_sample(logits, tau=1.0):
-            return F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+        """Full forward pass.
 
-        # One-hot vectors with gradients
-        z_soft = gumbel_sample(enc_logits, tau=1.0)   # [B, T, C, V]
-        z_tokens = z_soft.argmax(dim=-1)              # for logging only
-        # project z_soft into embedding space manually
-        emb_table = self.decoder.token_emb.weight  # [V, D]
-        z_emb = torch.einsum("btcv,vd->btcd", z_soft, emb_table)  # [B, T, C, D]
-        dec_logits = self.decoder.forward_embedded(z_emb)
+        tokens: [B, T, C]
+        returns: {loss, enc_logits, dec_logits, z_tokens}
+        """
+        enc_logits = self.encoder(tokens)                    # [B,L_l,V_l]      
+        z_tokens = enc_logits.argmax(dim=-1)                  # [B,L_l]
+        dec_logits = self.decoder(z_tokens)
+        # dec_logits = self.decoder.forward_soft_embedding(enc_logits)    # [B,T,C,V]
+        # loss = F.cross_entropy(dec_logits.view(-1, dec_logits.size(-1)), tokens.view(-1))
         loss = F.cross_entropy(
-            dec_logits.view(-1, dec_logits.size(-1)),
-            tokens.view(-1),
+            dec_logits.reshape(-1, dec_logits.size(-1)),  # [B*T*C, vocab_size]
+            tokens.reshape(-1)                            # [B*T*C]
         )
         return {
-            "loss": loss,
-            "enc_logits": enc_logits,
-            "dec_logits": dec_logits,
-            "z_tokens": z_tokens,
+            "loss": loss
         }
-
-# Example usage:
-# ae = TransformerAutoencoder(vocab_size=1024, n_codebooks=8)
-# out = ae(tokens)  # tokens: [B, T, C]
-
-
-def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
-    """
-    Split a (T, C) token grid into fixed-length segments, zero-padding the last.
-    """
-    T, C = tokens.shape
-    num_seg = math.ceil(T / seg_len)
-    pad = seg_len * num_seg - T
-    if pad:
-        pad_tensor = torch.zeros(pad, C, dtype=tokens.dtype, device=tokens.device)
-        tokens = torch.cat([tokens, pad_tensor], 0)
-    return list(tokens.view(num_seg, seg_len, C))

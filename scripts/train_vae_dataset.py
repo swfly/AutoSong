@@ -7,15 +7,31 @@ import torch.nn.functional as F
 from torch import nn, optim
 import re
 
+import math
+from typing import List, Tuple
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.audio_encoder import AudioEncoder
 from models.vq_vae import TransformerAutoencoder  # <-- Your new AE
-from models.vq_vae import chunk_encodec_tokens  # reuse chunking logic
+
+
+# -----------------------------------------------------------------------------
+#  Utilities
+# -----------------------------------------------------------------------------
+
+def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
+    """Split an EnCodec token grid (T, C) into equal-length segments (zero-padded)."""
+    T, C = tokens.shape
+    num_seg = math.ceil(T / seg_len)
+    pad = seg_len * num_seg - T
+    if pad:
+        pad_tensor = torch.zeros(pad, C, dtype=tokens.dtype, device=tokens.device)
+        tokens = torch.cat([tokens, pad_tensor], 0)
+    return list(tokens.view(num_seg, seg_len, C))
 
 # ─────────────────────── config ─────────────────────── #
-SEG_LEN          = 64
-BATCH_SIZE       = 64
+SEG_LEN          = 256
+BATCH_SIZE       = 16
 EPOCHS           = 100000
 CHECKPOINT_PATH  = "checkpoints/discrete_ae_dataset.pt"
 DATASET_DIR      = "dataset"
@@ -62,27 +78,30 @@ tmp_tokens = encoder.encode(os.path.join(DATASET_DIR, "song_001", "song_001.mp3"
 N_CODEBOOKS = tmp_tokens.shape[1]
 
 model = TransformerAutoencoder(
-    vocab_size=VOCAB_SIZE,
+    input_token_vocab_size=VOCAB_SIZE,
     n_codebooks=N_CODEBOOKS,
-    embed_dim=512,
-    num_layers=6,
-    num_heads=8,
-    dropout=0.1,
-    max_seq_len=SEG_LEN
+    segment_length=SEG_LEN,
+    latent_seq_len=8,
+    latent_vocab_size=2,
+    embed_dim=64,
+    latent_dim=64,
+    num_layers=1,
+    num_heads=2,
+    dropout=0.0
 ).to(device)
 
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
 start_epoch = 1
 
 if os.path.exists(CHECKPOINT_PATH):
     print(f"🔁 Loading checkpoint from {CHECKPOINT_PATH}")
     ckpt = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    #optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     start_epoch = ckpt.get("epoch", 0) + 1
     print(f"⏩ Resuming from epoch {start_epoch}")
 
-song_list = get_song_list(DATASET_DIR, max_songs=1000)
+song_list = get_song_list(DATASET_DIR, max_songs=1)
 
 # ─────────────────────── training loop ─────────────────────── #
 print("🚀 Starting Transformer AE training …")
@@ -112,7 +131,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     print(f"[Epoch {epoch:04d}] Loss: {loss.item():.4f}")
 
     # ───── Save checkpoint
-    if epoch % 200 == 0 or epoch == EPOCHS:
+    if epoch % 50 == 0 or epoch == EPOCHS:
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
