@@ -210,10 +210,11 @@ class SegmentVQVAE(nn.Module):
         tokens_prev: torch.Tensor,
         tokens_curr: torch.Tensor,
         tokens_next: torch.Tensor,
-        *,
         use_vq: bool = True,
         zero_second_prob: float = 0.0,
-        variance_loss_scale: float = 0.0
+        variance_loss_scale: float = 0.0,
+        instrumental_mask = False,
+        vocal_mask = False
     ) -> Tuple[torch.Tensor, dict]:
         B, T, C = tokens_curr.shape
 
@@ -230,8 +231,24 @@ class SegmentVQVAE(nn.Module):
         p_v_q, _, vq_pv = self.vq_vocal(p_v)
         c_v_q, _, vq_cv = self.vq_vocal(c_v)
         n_v_q, _, vq_nv = self.vq_vocal(n_v)
-
         vq_loss = vq_pi + vq_ci + vq_ni + vq_pv + vq_cv + vq_nv
+
+        if instrumental_mask:
+            p_v_q = torch.zeros_like(p_v_q)
+            c_v_q = torch.zeros_like(c_v_q)
+            n_v_q = torch.zeros_like(n_v_q)
+            vq_loss += torch.mean(p_v)
+            vq_loss += torch.mean(c_v)
+            vq_loss += torch.mean(n_v)
+
+        if vocal_mask:
+            p_i_q = torch.zeros_like(p_i_q)
+            c_i_q = torch.zeros_like(c_i_q)
+            n_i_q = torch.zeros_like(n_i_q)
+            vq_loss += torch.mean(p_i)
+            vq_loss += torch.mean(c_i)
+            vq_loss += torch.mean(n_i)
+            
 
         logits = self.decoder(
             p_i_q, p_v_q,

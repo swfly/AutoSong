@@ -13,7 +13,6 @@ import os
 import re
 
 def get_song_list(dataset_dir="dataset", max_songs=None):
-    max_songs = 1
     def song_number(s):
         match = re.search(r"song_(\d+)", s)
         return int(match.group(1)) if match else float("inf")
@@ -47,11 +46,22 @@ def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, 
         return []
     return [(segments[i], segments[i+1], segments[i+2]) for i in range(len(segments) - 2)]
 
+DATASET_DIR        = "dataset"
+DATASET_INST_DIR   = "dataset_inst"
+DATASET_VOCAL_DIR  = "dataset_vocal"
+n_songs = 4
+INST_RATE          = 0.0  # 30% epochs use instrumental-only data
+VOCAL_RATE         = 0.0  # 20% epochs use vocal-only data
+
+normal_song_list = get_song_list(DATASET_DIR, max_songs=10000)
+inst_song_list   = get_song_list(DATASET_INST_DIR)
+vocal_song_list  = get_song_list(DATASET_VOCAL_DIR)
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
 BATCH_SIZE = 64
 EPOCHS = 100000
 CHECKPOINT_PATH = "checkpoints/vqvae_dataset.pt"
+
 os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
 
 device = (
@@ -60,7 +70,6 @@ device = (
     else torch.device("cpu")
 )
 
-DATASET_DIR = "dataset"
 encoder = AudioEncoder(device=device, sample_rate=24000, bandwidth=6.0)
 VOCAB_SIZE = encoder.vocab_size
 
@@ -71,11 +80,11 @@ N_CODEBOOKS = tmp_tokens.shape[1]
 model = SegmentVQVAE(
     vocab_size=VOCAB_SIZE,
     n_codebooks=N_CODEBOOKS,
-    block_pairs=16,
+    block_pairs=32,
     seg_len=SEG_LEN,
-    latent_dim=256,
-    emb_dim=256,
-    latent_vocab_size=512,
+    latent_dim=1024,
+    emb_dim=512,
+    latent_vocab_size=4096,
     beta=0.2
 ).to(device)
 
@@ -92,20 +101,30 @@ if os.path.exists(CHECKPOINT_PATH):
 
 # ─────────────────────── training loop ─────────────────────── #
 print("🚀 Starting full dataset VAE training …")
-n_songs = 1
-song_list = get_song_list(max_songs=n_songs)
-train_vq = False
 for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     triplets = []
-    print("learning with", n_songs,"songs")
+    r = random.random()
+    if r < VOCAL_RATE and vocal_song_list:
+        mode = "vocal"
+        song_list = vocal_song_list
+        base_dir = DATASET_VOCAL_DIR
+    elif r < VOCAL_RATE + INST_RATE and inst_song_list:
+        mode = "instr"
+        song_list = inst_song_list
+        base_dir = DATASET_INST_DIR
+    else:
+        mode = "mix"
+        song_list = normal_song_list[:n_songs]
+        base_dir = DATASET_DIR
+    print(f"[Epoch {epoch:04d}] Mode: {mode.upper():>6} | songs: {len(song_list)}")
     while len(triplets) < BATCH_SIZE:
         song_dir = random.choice([
             d for d in os.listdir(DATASET_DIR)
             if os.path.isdir(os.path.join(DATASET_DIR, d))
         ])
         song_dir=random.sample(song_list, 1)[0]
-        song_path = os.path.join(DATASET_DIR, song_dir)
+        song_path = os.path.join(base_dir, song_dir)
         song_triplets = get_triplets_from_song(song_path)
         if song_triplets:
             triplets.extend(random.sample(song_triplets, min(int(BATCH_SIZE / 4), min(len(song_triplets), BATCH_SIZE - len(triplets)))))
@@ -116,27 +135,15 @@ for epoch in range(start_epoch, EPOCHS + 1):
     batch_next = torch.stack(batch_next).to(device)
 
     optimizer.zero_grad()
-    if train_vq:
-        loss, metrics = model(
-            batch_prev, batch_curr, batch_next,
-            zero_second_prob=0.2,
-        )
-    else:
-        loss, metrics = model.train_ae(
-            batch_prev, batch_curr, batch_next,
-            zero_second_prob=0.2,
-        )
+    loss, metrics = model(
+        batch_prev, batch_curr, batch_next,
+        zero_second_prob=0.2,
+    )
     loss.backward()
     optimizer.step()
 
     print(f"[Epoch {epoch:04d}] Loss: {metrics['total']:.4f} | Recon: {metrics['recon_loss']:.4f} | VQ: {metrics['vq_loss']:.4f}")
-    # if metrics['recon_loss'] < 5e-1:
-    #     if not train_vq:
-    #         train_vq = True
-    #     else:
-    #         n_songs += 2
-    #         song_list = get_song_list(max_songs=n_songs)
-    #         n_songs = min(len(song_list), n_songs)
+
     if epoch % 200 == 0 or epoch == EPOCHS:
         with torch.no_grad():
             z_i, z_v = model.encoder(batch_curr)
@@ -144,12 +151,12 @@ for epoch in range(start_epoch, EPOCHS + 1):
             _, code_ids_v, _ = model.vq_vocal(z_v)
             print(f"🧱 Instr codes used: {code_ids_i.unique().numel()}, Vocal codes used: {code_ids_v.unique().numel()}")
 
-        # torch.save({
-        #     "epoch": epoch,
-        #     "model_state_dict": model.state_dict(),
-        #     "optimizer_state_dict": optimizer.state_dict(),
-        # }, CHECKPOINT_PATH)
-        # print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+        }, CHECKPOINT_PATH)
+        print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
 
     del batch_prev, batch_curr, batch_next
     if torch.backends.mps.is_available():
