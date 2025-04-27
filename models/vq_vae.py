@@ -1,300 +1,326 @@
 from __future__ import annotations
+import math
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-def assert_finite(t, name):
-    if torch.isnan(t).any() or torch.isinf(t).any():
-        raise RuntimeError(f"{name} contains NaN/Inf")
-# -----------------------------------------------------------------------------
-#  LoRA utility (optional – not used inside the AE, but provided for extension)
-# -----------------------------------------------------------------------------
-class LoRALinear(nn.Module):
-    """Low-rank adaptation layer:  ΔW = B·A  (rank *r*)."""
-
-    def __init__(self, in_features: int, out_features: int, r: int = 4):
-        super().__init__()
-        self.A = nn.Parameter(torch.randn(r, in_features) * 0.01)
-        self.B = nn.Parameter(torch.randn(out_features, r) * 0.01)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, N, in]
-        return x @ (self.A.t() @ self.B.t())
-class gMLPBlock(nn.Module):
-    def __init__(self, d_model, expansion_factor=4):
-        super().__init__()
-        self.fc1 = nn.Linear(d_model, expansion_factor * d_model)
-        self.sgu = nn.Sequential(
-            nn.Linear(expansion_factor * d_model, expansion_factor * d_model),
-            nn.GELU()
-        )
-        self.fc2 = nn.Linear(expansion_factor * d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        x = self.fc1(x)
-        x = self.sgu(x)
-        x = self.fc2(x)
-        return x + residual
-# -----------------------------------------------------------------------------
-#  Encoder
-# -----------------------------------------------------------------------------
-class DiscreteEncoder(nn.Module):
-    """Map *EnCodec* tokens → distribution over latent codes of length *L*.
-
-    Input : tokens          [B, T, C]
-    Output: latent logits   [B, L, C, latent_vocab_size]
+# Quantizer takes [B, L_l, D_l] and 
+# tries to find a multi-channel token to best represent it
+# channel count is defined as "dim"
+class VectorQuantizer(nn.Module):
     """
+    EMA-based VQ layer (drop-in replacement for the straight-through VectorQuantizer).
+    """
+    def __init__(self, vocab_size: int, dim: int, beta: float = 0.1,
+                 decay: float = 0.99, eps: float = 1e-5):
+        super().__init__()
+        self.K = vocab_size
+        self.D = dim
+        self.beta = beta
+        self.decay = decay
+        self.eps = eps
 
+        # Codebook embeddings
+        self.embed = nn.Embedding(self.K, self.D)
+        nn.init.uniform_(self.embed.weight, -1.0 / self.K, 1.0 / self.K)
+
+        # EMA buffers
+        self.register_buffer('ema_cluster_size', torch.zeros(self.K))
+        self.register_buffer('ema_w', self.embed.weight.data.clone())
+
+    def forward(self, z: torch.Tensor):
+        # z: (B, N, D)
+        B, N, D = z.shape
+        flat_z = z.reshape(-1, D)  # (B*N, D)
+
+        # Compute distances to codebook
+        # dist: (B*N, K)
+        dist = (
+            flat_z.pow(2).sum(dim=1, keepdim=True)
+            - 2 * flat_z @ self.embed.weight.t()
+            + self.embed.weight.pow(2).sum(dim=1)
+        )
+        # Get codes
+        codes = dist.argmin(dim=1)  # (B*N,)
+        z_q = self.embed(codes).view(B, N, D)
+
+        # EMA codebook update
+        if self.training:
+            with torch.no_grad():
+                one_hot = F.one_hot(codes, self.K).type_as(flat_z)  # (B*N, K)
+                # Count and sums
+                cluster_size = one_hot.sum(dim=0)  # (K,)
+                dw = one_hot.t() @ flat_z          # (K, D)
+
+                # Update EMA variables
+                self.ema_cluster_size.mul_(self.decay).add_(cluster_size, alpha=1 - self.decay)
+                self.ema_w.mul_(self.decay).add_(dw,           alpha=1 - self.decay)
+
+                # Laplace smoothing of the cluster size
+                n = self.ema_cluster_size + self.eps
+                # Normalize ema_w and update embedding weight
+                updated_weight = self.ema_w / n.unsqueeze(1)
+                self.embed.weight.data.copy_(updated_weight)
+
+        # Commitment loss
+        commit_loss = F.mse_loss(z, z_q.detach())
+        loss = self.beta * commit_loss
+
+        # Straight-through estimator
+        z_q_st = z + (z_q - z).detach()
+        return z_q_st, codes.view(B, N), loss
+
+
+# ───────────────────────── CNN encoder ────────────────────────
+
+# Encoder transforms [B, L_s, C_s] to [B, L_l, D_l]
+# L_l is called "n_latent_blocks"
+
+class ConvSegmentEncoder(nn.Module):
     def __init__(
         self,
         vocab_size: int,
         n_codebooks: int,
-        seq_len: int,                  # maximum input T
-        latent_seq_len: int,           # desired latent length L
-        latent_vocab_size: int = 512,
-        embed_dim: int = 512,
-        latent_dim: int = 256,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-    ) -> None:
+        emb_dim: int,
+        latent_dim: int,
+        n_latent_blocks: int,
+    ):
         super().__init__()
-        self.latent_seq_len = latent_seq_len
-        self.latent_vocab_size = latent_vocab_size
-        self.n_codebooks = n_codebooks
-        D_e, D_l = embed_dim, latent_dim
+        self.emb = nn.Embedding(vocab_size, emb_dim)
+        in_dim = emb_dim * n_codebooks
+        hid = latent_dim * 4
 
-        # token / channel / position embeddings
-        self.token_emb   = nn.Embedding(vocab_size, D_e)
-        self.channel_emb = nn.Embedding(n_codebooks, D_e)
-        self.pos_emb     = nn.Parameter(torch.randn(1, seq_len, D_e) * 0.02)
-        nn.init.uniform_(self.token_emb.weight, a=-1.0, b=1.0)
-        nn.init.uniform_(self.channel_emb.weight, a=-1.0, b=1.0)
-
-        self.in_proj = nn.Linear(D_e, D_l) if D_e != D_l else nn.Identity()
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=D_l,
-            nhead=num_heads,
-            dim_feedforward=4 * D_l,
-            dropout=dropout,
-            batch_first=True,
+        self.conv_feat = nn.Sequential(
+            nn.Conv1d(in_dim, hid, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv1d(hid, 2 * latent_dim, 1),  # → 2D channels
+            nn.ReLU(),
         )
-        self.tfm = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.pool_proj = nn.Linear(seq_len * n_codebooks, latent_seq_len)
-        self.out_proj = nn.Linear(D_l, latent_vocab_size)
+        self.pool = nn.AdaptiveAvgPool1d(n_latent_blocks)
 
-    # ---------------------------------------------------------------------
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:  # [B,T,C]
-        B, T, C = tokens.shape
-        assert C == self.n_codebooks, "C does not match n_codebooks"
-
-        # Embedding + positional & channel encodings ––> [B, T, C, D_e]
-        x = self.token_emb(tokens.view(B, T * C)).view(B, T, C, -1)
-        ch = self.channel_emb(torch.arange(C, device=tokens.device)).view(1, 1, C, -1)
-        pos = self.pos_emb[:, :T, :].unsqueeze(2)
-        x = x + ch + pos
-
-        # [B, T*C, D_e] → project → Transformer
-        x = self.in_proj(x.view(B, T * C, -1))      # [B, T*C, D_l]
-        x = self.tfm(x)                           # [B, D_l, T*C]
-        
-        # project [T*C, D_l] to [L_l, D_l] via pooling
-        # x: [B, T*C, D_l]
-        x = x.permute(0, 2, 1)  # [B, D_l, T*C]
-        # Downsample sequence: T*C -> L_l
-        x = self.pool_proj(x)                      # [B, D_l, L]
-        x = x.permute(0, 2, 1) 
-
-        # Project to distribution
-        logits = self.out_proj(x)            # [B, L_l, V_l]
-        return logits
-
-# -----------------------------------------------------------------------------
-#  Decoder
-# -----------------------------------------------------------------------------
-class DiscreteDecoder(nn.Module):
-    """Reconstruct original tokens from latent codes.
-
-    latent tokens:  [B, L, C] or embedded [B, L, C, D_e]
-    output logits : [B, T, C, vocab_size]
-    """
-
-    def __init__(
-        self,
-        latent_vocab_size: int,
-        latent_len: int,
-        output_token_vocab_size: int,
-        n_codebooks: int,
-        target_seq_len: int,   # original T (for up-sampling)
-        embed_dim: int = 512,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.decode_segment_len = target_seq_len
-        self.n_codebooks = n_codebooks
-        self.embed_dim = embed_dim
-        self.latent_emb  = nn.Embedding(latent_vocab_size, embed_dim)
-        self.pos_emb_lat = nn.Parameter(torch.randn(1, latent_len, embed_dim) * 0.02)
-        self.channel_emb = nn.Embedding(n_codebooks, embed_dim)
-        nn.init.uniform_(self.latent_emb.weight, a=-1.0, b=1.0)
-        nn.init.uniform_(self.channel_emb.weight, a=-1.0, b=1.0)
-        
-        D_l = embed_dim
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=D_l,
-            nhead=num_heads,
-            dim_feedforward=4 * D_l,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.tfm = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.out_proj = nn.Linear(embed_dim, output_token_vocab_size)
-
-    def straight_through_softmax(self, logits, tau=1.0):
-        # Soft sample
-        soft = F.softmax(logits / tau, dim=-1)
-        # Hard sample
-        index = soft.argmax(dim=-1, keepdim=True)
-        hard = torch.zeros_like(logits).scatter_(-1, index, 1.0)
-        # Straight-through
-        return hard + soft - hard.detach()
-    # full discrete path -------------------------------------------------
-    def forward_soft_embedding(self, z_logits): #[B, L_l, V_l] token sequence, no channel
-        B, L_l, V = z_logits.shape
-        D = self.embed_dim
-        C = self.n_codebooks
-        T = self.decode_segment_len
-        # 1. Soft-Embed latent tokens
-        z_soft = self.straight_through_softmax(z_logits)
-        z_emb = torch.einsum('blv,vd->bld', z_soft, self.latent_emb.weight)  # [B, L_l, D]
-        # # 2. Add latent positional embedding
-        pos_lat = self.pos_emb_lat[:, :L_l, :]  # [1, L_l, D]
-        z_emb = z_emb + pos_lat  # [B, L_l, D]
-        z_emb = z_emb.unsqueeze(2).expand(-1, -1, C, -1)  # [B, L_l, C, D]
-        # 4. Add channel embedding
-        ch_emb = self.channel_emb(torch.arange(C, device=z_logits.device)).view(1, 1, C, D)
-        z_emb = z_emb + ch_emb  # [B, L_l, C, D]
-        # 5. Upsample L_l → T
-        z_emb = z_emb.permute(0, 2, 3, 1)  # [B, C, D, L_l]
-        z_emb = z_emb.reshape(B * C, D, L_l)  # [B*C, D, L_l]
-        z_emb = F.interpolate(z_emb, size=T, mode="nearest")  # [B*C, D, T]
-        z_emb = z_emb.view(B, C, D, T).permute(0, 3, 1, 2)  # [B, T, C, D]
-        z_emb = z_emb.reshape(B, T * C, D)  # [B, T*C, D]
-        x = z_emb
-        x = self.tfm(x)         # [B, D, T*C]
-        # 9. Reshape back
-        x = x.view(B, T, C, D)  # [B, T, C, D]
-
-        # 10. Output projection per codebook
-        logits = self.out_proj(x)  # [B, T, C, vocab_size]
-        return logits
-
-    def forward(self, z_tokens: torch.Tensor) -> torch.Tensor:  # [B,L_l]
-        B, L_l = z_tokens.shape
-        D = self.embed_dim
-        C = self.n_codebooks
-        T = self.decode_segment_len
-
-        # 1. Embed latent tokens
-        z_emb = self.latent_emb(z_tokens)  # [B, L_l, D]
-        # 2. Add latent positional embedding
-        pos_lat = self.pos_emb_lat[:, :L_l, :]  # [1, L_l, D]
-        z_emb = z_emb + pos_lat  # [B, L_l, D]
-        z_emb = z_emb.unsqueeze(2).expand(-1, -1, C, -1)  # [B, L_l, C, D]
-        # 4. Add channel embedding
-        ch_emb = self.channel_emb(torch.arange(C, device=z_tokens.device)).view(1, 1, C, D)
-        z_emb = z_emb + ch_emb  # [B, L_l, C, D]
-        # 5. Upsample L_l → T
-        z_emb = z_emb.permute(0, 2, 3, 1)  # [B, C, D, L_l]
-        z_emb = z_emb.reshape(B * C, D, L_l)  # [B*C, D, L_l]
-        z_emb = F.interpolate(z_emb, size=T, mode="nearest")  # [B*C, D, T]
-        z_emb = z_emb.view(B, C, D, T).permute(0, 3, 1, 2)  # [B, T, C, D]
-        z_emb = z_emb.reshape(B, T * C, D)  # [B, T*C, D]
-        x = z_emb
-        x = self.tfm(x)         # [B, D, T*C]
-        # 9. Reshape back
-        x = x.view(B, T, C, D)  # [B, T, C, D]
-
-        # 10. Output projection per codebook
-        logits = self.out_proj(x)  # [B, T, C, vocab_size]
-        return logits
-
-# -----------------------------------------------------------------------------
-#  Auto-encoder wrapper
-# -----------------------------------------------------------------------------
-class TransformerAutoencoder(nn.Module):
-    """Encode → sample → decode."""
-
-    def __init__(
-        self,
-        *,
-        input_token_vocab_size: int,
-        n_codebooks: int,
-        segment_length: int,          # maximum input T
-        latent_seq_len: int,          # compressed length L
-        latent_vocab_size: int = 512,
-        embed_dim: int = 512,
-        latent_dim: int = 256,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-
-        # encoder
-        self.encoder = DiscreteEncoder(
-            vocab_size=input_token_vocab_size,
-            n_codebooks=n_codebooks,
-            seq_len=segment_length,
-            latent_seq_len=latent_seq_len,
-            latent_vocab_size=latent_vocab_size,
-            embed_dim=embed_dim,
-            latent_dim=latent_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            dropout=dropout,
-        )
-
-        # decoder
-        self.decoder = DiscreteDecoder(
-            latent_vocab_size=latent_vocab_size,
-            latent_len=latent_seq_len,
-            output_token_vocab_size=input_token_vocab_size,
-            n_codebooks=n_codebooks,
-            target_seq_len=segment_length,
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            dropout=dropout
-        )
-    # ------------------------------------------------------------------
-    def _gumbel_soft(self, logits: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
-        g = -torch.empty_like(logits).exponential_().log() + 1e-8  # Gumbel(0,1)
-        return F.softmax((logits + g) / tau, dim=-1)
-    def gumbel_sample(self,logits, tau=1.0):
-        eps = 1e-20
-        noise = -torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
-        return F.softmax((logits + noise) / tau, dim=-1)
-    # ------------------------------------------------------------------
-    def forward(self, tokens: torch.Tensor) -> dict:
-        """Full forward pass.
-
-        tokens: [B, T, C]
-        returns: {loss, enc_logits, dec_logits, z_tokens}
+    def forward(self, tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        enc_logits = self.encoder(tokens)                    # [B,L_l,V_l]      
-        # z_tokens = enc_logits.argmax(dim=-1)                  # [B,L_l]
-        # dec_logits = self.decoder(z_tokens)
-        dec_logits = self.decoder.forward_soft_embedding(enc_logits)    # [B,T,C,V]
-        # loss = F.cross_entropy(dec_logits.view(-1, dec_logits.size(-1)), tokens.view(-1))
-        loss = F.cross_entropy(
-            dec_logits.reshape(-1, dec_logits.size(-1)),  # [B*T*C, vocab_size]
-            tokens.reshape(-1)                            # [B*T*C]
+        tokens : (B, 256, C)
+        """
+        B, T, C = tokens.shape
+        x = self.emb(tokens).view(B, T, -1).transpose(1, 2)   # (B, C·emb , T)
+        x = self.conv_feat(x)                                 # (B, 2D , T)
+        x = self.pool(x).transpose(1, 2)                      # (B, N , 2D)
+        return x.chunk(2, dim=-1)                             # (B,N,D) ×2
+
+
+# ───────────────────── transformer decoder ────────────────────
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=4):
+        super().__init__()
+        self.in_features  = in_features
+        self.out_features = out_features
+        self.r            = r
+
+        # Learnable low-rank adapters only
+        self.A = nn.Parameter(torch.randn(r, in_features) * 0.01)
+        self.B = nn.Parameter(torch.randn(out_features, r) * 0.01)
+
+    def forward(self, x):
+        # x: [B, N, in_features]
+        return (x @ self.A.T) @ self.B.T
+
+class TransformerSegmentDecoder(nn.Module):
+    """
+    Takes SIX quantised streams (prev/cur/next × instru/vocal) and
+    reconstructs current-segment logits.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        n_codebooks: int,
+        latent_dim: int,
+        n_latent_blocks: int,
+        seg_len: int,
+    ):
+        super().__init__()
+        self.seg_len = seg_len
+        self.vocab_size = vocab_size
+        self.n_codebooks = n_codebooks
+
+        d_model = latent_dim
+        self.pos = nn.Parameter(torch.randn(1, 6 * n_latent_blocks, d_model))
+
+        enc_layer = nn.TransformerEncoderLayer(d_model, nhead=4, dim_feedforward=512)
+        self.tf = nn.TransformerEncoder(enc_layer, num_layers=1)
+
+        self.proj = LoRALinear(
+            in_features  = 6 * n_latent_blocks * d_model,
+            out_features = seg_len * n_codebooks * vocab_size,
+            r = 8
         )
-        return {
-            "loss": loss
+
+    def forward(
+        self,
+        z_prev_i, z_prev_v,
+        z_curr_i, z_curr_v,
+        z_next_i, z_next_v
+    ):
+        """
+        Each z_xx_* : (B, N, D)
+        returns logits (B, T, C, V)
+        """
+        B = z_curr_i.size(0)
+        z = torch.cat(
+            [z_prev_i, z_prev_v, z_curr_i, z_curr_v, z_next_i, z_next_v],
+            dim=1
+        )                                            # (B, 6N, D)
+        z = z + self.pos[:, : z.size(1), :]          # add learned pos
+        z = self.tf(z.permute(1, 0, 2)).permute(1, 0, 2)  # (B, 6N, D)
+        out = self.proj(z.flatten(1))                       # (B, T·C·V)
+        out = out.view(B, self.seg_len, self.n_codebooks, self.vocab_size)
+        return out
+
+
+# ───────────────────────── VQ-VAE wrapper ─────────────────────
+class SegmentVQVAE(nn.Module):
+    """
+    CNN encoder → two VQ codebooks → Transformer decoder.
+    API unchanged from previous versions.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        n_codebooks: int,
+        seg_len: int,
+        block_pairs: int = 4,
+        num_codes: int = 512,
+        emb_dim: int = 128,
+        latent_dim: int = 128,
+        beta: float = 0.05,
+    ):
+        super().__init__()
+        self.seg_len = seg_len
+        self.vocab_size = vocab_size
+        self.n_codebooks = n_codebooks
+
+        self.encoder = ConvSegmentEncoder(
+            vocab_size, n_codebooks, emb_dim, latent_dim, block_pairs
+        )
+        self.vq_instru = VectorQuantizer(num_codes, latent_dim, beta)
+        self.vq_vocal  = VectorQuantizer(num_codes, latent_dim, beta)
+
+        self.decoder = TransformerSegmentDecoder(
+            vocab_size, n_codebooks, latent_dim, block_pairs, seg_len
+        )
+
+    # ─────────────────── forward ────────────────────
+    def forward(
+        self,
+        tokens_prev: torch.Tensor,
+        tokens_curr: torch.Tensor,
+        tokens_next: torch.Tensor,
+        *,
+        use_vq: bool = True,
+        zero_second_prob: float = 0.0,
+        variance_loss_scale: float = 0.0
+    ) -> Tuple[torch.Tensor, dict]:
+        B, T, C = tokens_curr.shape
+
+        # encode three segments
+        p_i, p_v = self.encoder(tokens_prev)
+        c_i, c_v = self.encoder(tokens_curr)
+        n_i, n_v = self.encoder(tokens_next)
+
+        print(p_i.shape)
+        # Quantize normally
+        p_i_q, p_c_q, vq_pi = self.vq_instru(p_i)
+        c_i_q, c_c_q, vq_ci = self.vq_instru(c_i)
+        n_i_q, n_c_q, vq_ni = self.vq_instru(n_i)
+        print(p_c_q.shape)
+        quit()
+
+        p_v_q, _, vq_pv = self.vq_vocal(p_v)
+        c_v_q, _, vq_cv = self.vq_vocal(c_v)
+        n_v_q, _, vq_nv = self.vq_vocal(n_v)
+
+        vq_loss = vq_pi + vq_ci + vq_ni + vq_pv + vq_cv + vq_nv
+
+        logits = self.decoder(
+            p_i_q, p_v_q,
+            c_i_q, c_v_q,
+            n_i_q, n_v_q
+        )
+
+        recon_loss = F.cross_entropy(
+            logits.reshape(B * T * C, self.vocab_size),
+            tokens_curr.reshape(B * T * C).long(),
+            reduction="mean"
+        )
+
+        total_loss = recon_loss + vq_loss
+
+        return total_loss, {
+            "recon_loss": recon_loss.detach(),
+            "vq_loss":    vq_loss.detach(),
+            "total":      total_loss.detach(),
         }
+    def train_ae(
+        self,
+        tokens_prev: torch.Tensor,
+        tokens_curr: torch.Tensor,
+        tokens_next: torch.Tensor,
+        *,
+        use_vq: bool = True,  # still accepts flag, but ignored here
+        zero_second_prob: float = 0.0,
+        variance_loss_scale: float = 0.0
+    ) -> Tuple[torch.Tensor, dict]:
+        B, T, C = tokens_curr.shape
+
+        # --- encode three segments directly ---
+        p_i, p_v = self.encoder(tokens_prev)
+        c_i, c_v = self.encoder(tokens_curr)
+        n_i, n_v = self.encoder(tokens_next)
+
+        # 🔁 skip VQ, use encoder output directly
+        p_i_q = p_i
+        c_i_q = c_i
+        n_i_q = n_i
+
+        p_v_q = p_v
+        c_v_q = c_v
+        n_v_q = n_v
+
+        # --- decode ---
+        logits = self.decoder(
+            p_i_q, p_v_q,
+            c_i_q, c_v_q,
+            n_i_q, n_v_q
+        )  # (B, T, C, V)
+
+        # --- compute reconstruction loss only ---
+        recon_loss = F.cross_entropy(
+            logits.reshape(B * T * C, self.vocab_size),
+            tokens_curr.reshape(B * T * C).long(),
+            reduction="mean"
+        )
+
+        total_loss = recon_loss
+
+        return total_loss, {
+            "recon_loss": recon_loss.detach(),
+            "vq_loss":    torch.tensor(0.0, device=logits.device),
+            "total":      total_loss.detach(),
+        }
+
+
+
+# ───────────────────────── utility ────────────────────────────
+def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
+    """
+    Split a (T, C) token grid into fixed-length segments, zero-padding the last.
+    """
+    T, C = tokens.shape
+    num_seg = math.ceil(T / seg_len)
+    pad = seg_len * num_seg - T
+    if pad:
+        pad_tensor = torch.zeros(pad, C, dtype=tokens.dtype, device=tokens.device)
+        tokens = torch.cat([tokens, pad_tensor], 0)
+    return list(tokens.view(num_seg, seg_len, C))
