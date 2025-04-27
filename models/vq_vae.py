@@ -19,7 +19,24 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [B, N, in]
         return x @ (self.A.t() @ self.B.t())
+class gMLPBlock(nn.Module):
+    def __init__(self, d_model, expansion_factor=4):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, expansion_factor * d_model)
+        self.sgu = nn.Sequential(
+            nn.Linear(expansion_factor * d_model, expansion_factor * d_model),
+            nn.GELU()
+        )
+        self.fc2 = nn.Linear(expansion_factor * d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
 
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.sgu(x)
+        x = self.fc2(x)
+        return x + residual
 # -----------------------------------------------------------------------------
 #  Encoder
 # -----------------------------------------------------------------------------
@@ -53,9 +70,10 @@ class DiscreteEncoder(nn.Module):
         self.token_emb   = nn.Embedding(vocab_size, D_e)
         self.channel_emb = nn.Embedding(n_codebooks, D_e)
         self.pos_emb     = nn.Parameter(torch.randn(1, seq_len, D_e) * 0.02)
+        nn.init.uniform_(self.token_emb.weight, a=-1.0, b=1.0)
+        nn.init.uniform_(self.channel_emb.weight, a=-1.0, b=1.0)
 
         self.in_proj = nn.Linear(D_e, D_l) if D_e != D_l else nn.Identity()
-
         enc_layer = nn.TransformerEncoderLayer(
             d_model=D_l,
             nhead=num_heads,
@@ -64,7 +82,7 @@ class DiscreteEncoder(nn.Module):
             batch_first=True,
         )
         self.tfm = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-
+        self.pool_proj = nn.Linear(seq_len * n_codebooks, latent_seq_len)
         self.out_proj = nn.Linear(D_l, latent_vocab_size)
 
     # ---------------------------------------------------------------------
@@ -80,13 +98,13 @@ class DiscreteEncoder(nn.Module):
 
         # [B, T*C, D_e] → project → Transformer
         x = self.in_proj(x.view(B, T * C, -1))      # [B, T*C, D_l]
-        x = self.tfm(x)                             # [B, T*C, D_l]
+        x = self.tfm(x)                           # [B, D_l, T*C]
         
         # project [T*C, D_l] to [L_l, D_l] via pooling
         # x: [B, T*C, D_l]
         x = x.permute(0, 2, 1)  # [B, D_l, T*C]
         # Downsample sequence: T*C -> L_l
-        x = F.adaptive_avg_pool1d(x, output_size=self.latent_seq_len) 
+        x = self.pool_proj(x)                      # [B, D_l, L]
         x = x.permute(0, 2, 1) 
 
         # Project to distribution
@@ -122,16 +140,18 @@ class DiscreteDecoder(nn.Module):
         self.latent_emb  = nn.Embedding(latent_vocab_size, embed_dim)
         self.pos_emb_lat = nn.Parameter(torch.randn(1, latent_len, embed_dim) * 0.02)
         self.channel_emb = nn.Embedding(n_codebooks, embed_dim)
-        dec_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
+        nn.init.uniform_(self.latent_emb.weight, a=-1.0, b=1.0)
+        nn.init.uniform_(self.channel_emb.weight, a=-1.0, b=1.0)
+        
+        D_l = embed_dim
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=D_l,
             nhead=num_heads,
-            dim_feedforward=4 * embed_dim,
+            dim_feedforward=4 * D_l,
             dropout=dropout,
             batch_first=True,
         )
-        # Simpler: share architecture with encoder; we *upsample* latents beforehand
-        self.tfm = nn.TransformerEncoder(dec_layer, num_layers=num_layers)
-
+        self.tfm = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
         self.out_proj = nn.Linear(embed_dim, output_token_vocab_size)
 
     def straight_through_softmax(self, logits, tau=1.0):
@@ -149,10 +169,9 @@ class DiscreteDecoder(nn.Module):
         C = self.n_codebooks
         T = self.decode_segment_len
         # 1. Soft-Embed latent tokens
-        #z_soft = F.softmax(z_logits, dim=-1)  # [B, L_l, V]
         z_soft = self.straight_through_softmax(z_logits)
         z_emb = torch.einsum('blv,vd->bld', z_soft, self.latent_emb.weight)  # [B, L_l, D]
-        # 2. Add latent positional embedding
+        # # 2. Add latent positional embedding
         pos_lat = self.pos_emb_lat[:, :L_l, :]  # [1, L_l, D]
         z_emb = z_emb + pos_lat  # [B, L_l, D]
         z_emb = z_emb.unsqueeze(2).expand(-1, -1, C, -1)  # [B, L_l, C, D]
@@ -165,7 +184,8 @@ class DiscreteDecoder(nn.Module):
         z_emb = F.interpolate(z_emb, size=T, mode="nearest")  # [B*C, D, T]
         z_emb = z_emb.view(B, C, D, T).permute(0, 3, 1, 2)  # [B, T, C, D]
         z_emb = z_emb.reshape(B, T * C, D)  # [B, T*C, D]
-        x = self.tfm(z_emb)  # [B, T*C, D]
+        x = z_emb
+        x = self.tfm(x)         # [B, D, T*C]
         # 9. Reshape back
         x = x.view(B, T, C, D)  # [B, T, C, D]
 
@@ -194,7 +214,8 @@ class DiscreteDecoder(nn.Module):
         z_emb = F.interpolate(z_emb, size=T, mode="nearest")  # [B*C, D, T]
         z_emb = z_emb.view(B, C, D, T).permute(0, 3, 1, 2)  # [B, T, C, D]
         z_emb = z_emb.reshape(B, T * C, D)  # [B, T*C, D]
-        x = self.tfm(z_emb)  # [B, T*C, D]
+        x = z_emb
+        x = self.tfm(x)         # [B, D, T*C]
         # 9. Reshape back
         x = x.view(B, T, C, D)  # [B, T, C, D]
 
@@ -266,9 +287,9 @@ class TransformerAutoencoder(nn.Module):
         returns: {loss, enc_logits, dec_logits, z_tokens}
         """
         enc_logits = self.encoder(tokens)                    # [B,L_l,V_l]      
-        z_tokens = enc_logits.argmax(dim=-1)                  # [B,L_l]
-        dec_logits = self.decoder(z_tokens)
-        # dec_logits = self.decoder.forward_soft_embedding(enc_logits)    # [B,T,C,V]
+        # z_tokens = enc_logits.argmax(dim=-1)                  # [B,L_l]
+        # dec_logits = self.decoder(z_tokens)
+        dec_logits = self.decoder.forward_soft_embedding(enc_logits)    # [B,T,C,V]
         # loss = F.cross_entropy(dec_logits.view(-1, dec_logits.size(-1)), tokens.view(-1))
         loss = F.cross_entropy(
             dec_logits.reshape(-1, dec_logits.size(-1)),  # [B*T*C, vocab_size]

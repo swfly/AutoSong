@@ -43,6 +43,7 @@ device = torch.device("cuda" if torch.cuda.is_available()
 
 # ─────────────────── helper: dataset listing ─────────────────── #
 def get_song_list(dataset_dir, max_songs=None):
+    max_songs = 1
     def song_number(s):
         m = re.search(r"song_(\d+)", s)
         return int(m.group(1)) if m else float("inf")
@@ -81,16 +82,16 @@ model = TransformerAutoencoder(
     input_token_vocab_size=VOCAB_SIZE,
     n_codebooks=N_CODEBOOKS,
     segment_length=SEG_LEN,
-    latent_seq_len=8,
-    latent_vocab_size=2,
-    embed_dim=64,
-    latent_dim=64,
-    num_layers=1,
-    num_heads=2,
+    latent_seq_len=256,
+    latent_vocab_size=2048,
+    embed_dim=256,
+    latent_dim=256,
+    num_layers=2,
+    num_heads=4,
     dropout=0.0
 ).to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 start_epoch = 1
 
 if os.path.exists(CHECKPOINT_PATH):
