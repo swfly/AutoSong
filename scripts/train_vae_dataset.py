@@ -13,6 +13,7 @@ import os
 import re
 
 def get_song_list(dataset_dir="dataset", max_songs=None):
+    max_songs = 1
     def song_number(s):
         match = re.search(r"song_(\d+)", s)
         return int(match.group(1)) if match else float("inf")
@@ -64,7 +65,7 @@ encoder = AudioEncoder(device=device, sample_rate=24000, bandwidth=6.0)
 VOCAB_SIZE = encoder.vocab_size
 
 # Load a sample just to get codebook count
-tmp_tokens = encoder.encode("dataset/song_001/song_001.mp3")
+tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 N_CODEBOOKS = tmp_tokens.shape[1]
 
 model = SegmentVQVAE(
@@ -74,11 +75,11 @@ model = SegmentVQVAE(
     seg_len=SEG_LEN,
     latent_dim=256,
     emb_dim=256,
-    num_codes=512,
+    latent_vocab_size=512,
     beta=0.2
 ).to(device)
 
-optimizer = optim.Adam(model.parameters(), lr=5e-5)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
 start_epoch = 1
 
 if os.path.exists(CHECKPOINT_PATH):
@@ -115,7 +116,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     batch_next = torch.stack(batch_next).to(device)
 
     optimizer.zero_grad()
-    if train_vq or True:
+    if train_vq:
         loss, metrics = model(
             batch_prev, batch_curr, batch_next,
             zero_second_prob=0.2,
@@ -129,13 +130,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
     optimizer.step()
 
     print(f"[Epoch {epoch:04d}] Loss: {metrics['total']:.4f} | Recon: {metrics['recon_loss']:.4f} | VQ: {metrics['vq_loss']:.4f}")
-    if metrics['recon_loss'] < 5e-1:
-        if not train_vq:
-            train_vq = True
-        else:
-            n_songs += 2
-            song_list = get_song_list(max_songs=n_songs)
-            n_songs = min(len(song_list), n_songs)
+    # if metrics['recon_loss'] < 5e-1:
+    #     if not train_vq:
+    #         train_vq = True
+    #     else:
+    #         n_songs += 2
+    #         song_list = get_song_list(max_songs=n_songs)
+    #         n_songs = min(len(song_list), n_songs)
     if epoch % 200 == 0 or epoch == EPOCHS:
         with torch.no_grad():
             z_i, z_v = model.encoder(batch_curr)
@@ -143,13 +144,16 @@ for epoch in range(start_epoch, EPOCHS + 1):
             _, code_ids_v, _ = model.vq_vocal(z_v)
             print(f"🧱 Instr codes used: {code_ids_i.unique().numel()}, Vocal codes used: {code_ids_v.unique().numel()}")
 
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        }, CHECKPOINT_PATH)
-        print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
+        # torch.save({
+        #     "epoch": epoch,
+        #     "model_state_dict": model.state_dict(),
+        #     "optimizer_state_dict": optimizer.state_dict(),
+        # }, CHECKPOINT_PATH)
+        # print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
 
     del batch_prev, batch_curr, batch_next
-    torch.mps.empty_cache()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()

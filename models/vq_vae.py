@@ -7,17 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Quantizer takes [B, L_l, D_l] and 
-# tries to find a multi-channel token to best represent it
-# channel count is defined as "dim"
+# tries to find a single-channel token to best represent it;
+# a quick way to have multi-channel tokens is to have multiple quantizers.
 class VectorQuantizer(nn.Module):
-    """
-    EMA-based VQ layer (drop-in replacement for the straight-through VectorQuantizer).
-    """
-    def __init__(self, vocab_size: int, dim: int, beta: float = 0.1,
+    def __init__(self, vocab_size: int, latent_dim: int, beta: float = 0.1,
                  decay: float = 0.99, eps: float = 1e-5):
         super().__init__()
         self.K = vocab_size
-        self.D = dim
+        self.D = latent_dim
         self.beta = beta
         self.decay = decay
         self.eps = eps
@@ -77,6 +74,9 @@ class VectorQuantizer(nn.Module):
 
 # Encoder transforms [B, L_s, C_s] to [B, L_l, D_l]
 # L_l is called "n_latent_blocks"
+# D_l is latent_dim
+# We may use the same latent_dim across the whole autoencoder,
+# since higher value doesn't make any sense.
 
 class ConvSegmentEncoder(nn.Module):
     def __init__(
@@ -127,11 +127,9 @@ class LoRALinear(nn.Module):
         # x: [B, N, in_features]
         return (x @ self.A.T) @ self.B.T
 
+# Taking 6 embedded sequences (using VQ's embedding), concatenating all of them
+# then calculates the final sequence distribution
 class TransformerSegmentDecoder(nn.Module):
-    """
-    Takes SIX quantised streams (prev/cur/next × instru/vocal) and
-    reconstructs current-segment logits.
-    """
     def __init__(
         self,
         vocab_size: int,
@@ -163,10 +161,6 @@ class TransformerSegmentDecoder(nn.Module):
         z_curr_i, z_curr_v,
         z_next_i, z_next_v
     ):
-        """
-        Each z_xx_* : (B, N, D)
-        returns logits (B, T, C, V)
-        """
         B = z_curr_i.size(0)
         z = torch.cat(
             [z_prev_i, z_prev_v, z_curr_i, z_curr_v, z_next_i, z_next_v],
@@ -180,18 +174,17 @@ class TransformerSegmentDecoder(nn.Module):
 
 
 # ───────────────────────── VQ-VAE wrapper ─────────────────────
+
+#The VQ builds single-channel token vocabulary, with size = latent_vocab_size
+
 class SegmentVQVAE(nn.Module):
-    """
-    CNN encoder → two VQ codebooks → Transformer decoder.
-    API unchanged from previous versions.
-    """
     def __init__(
         self,
         vocab_size: int,
         n_codebooks: int,
         seg_len: int,
         block_pairs: int = 4,
-        num_codes: int = 512,
+        latent_vocab_size: int = 512,
         emb_dim: int = 128,
         latent_dim: int = 128,
         beta: float = 0.05,
@@ -204,8 +197,8 @@ class SegmentVQVAE(nn.Module):
         self.encoder = ConvSegmentEncoder(
             vocab_size, n_codebooks, emb_dim, latent_dim, block_pairs
         )
-        self.vq_instru = VectorQuantizer(num_codes, latent_dim, beta)
-        self.vq_vocal  = VectorQuantizer(num_codes, latent_dim, beta)
+        self.vq_instru = VectorQuantizer(latent_vocab_size, latent_dim, beta)
+        self.vq_vocal  = VectorQuantizer(latent_vocab_size, latent_dim, beta)
 
         self.decoder = TransformerSegmentDecoder(
             vocab_size, n_codebooks, latent_dim, block_pairs, seg_len
@@ -229,13 +222,10 @@ class SegmentVQVAE(nn.Module):
         c_i, c_v = self.encoder(tokens_curr)
         n_i, n_v = self.encoder(tokens_next)
 
-        print(p_i.shape)
         # Quantize normally
         p_i_q, p_c_q, vq_pi = self.vq_instru(p_i)
         c_i_q, c_c_q, vq_ci = self.vq_instru(c_i)
         n_i_q, n_c_q, vq_ni = self.vq_instru(n_i)
-        print(p_c_q.shape)
-        quit()
 
         p_v_q, _, vq_pv = self.vq_vocal(p_v)
         c_v_q, _, vq_cv = self.vq_vocal(c_v)
