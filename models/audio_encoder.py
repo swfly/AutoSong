@@ -1,60 +1,81 @@
 import torch
-from encodec import EncodecModel
-from encodec.utils import convert_audio
 import torchaudio
+import torchaudio.transforms as T
 import warnings
+
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
+
 class AudioEncoder:
-    def __init__(self, device="cuda", sample_rate=48000, bandwidth=1.5):
-        if sample_rate == 48000:
-            self.model = EncodecModel.encodec_model_48khz()
-        elif sample_rate == 24000:
-            self.model = EncodecModel.encodec_model_24khz()
-        else:
-            raise Exception("unsupported sampling rate")
+    def __init__(self, device="cuda", sample_rate=48000, n_mels=128, n_fft=1024, hop_length=256):
         self.device = device
-        self.model.set_target_bandwidth(bandwidth)
-        self.model.eval().to(self.device)
         self.sample_rate = sample_rate
-        self.channels = self.model.channels  # Number of channels for the model (quantizers)
-        
-        # Access the codebook and determine the vocabulary size
-        try:
-            # Iterate over each vector quantization layer in the quantizer
-            quantizer = self.model.quantizer.vq
-            first_codebook = quantizer.layers[0]._codebook  # Assuming all codebooks have the same size
-            
-            # The vocabulary size is the first dimension of the codebook
-            self.vocab_size = first_codebook.codebook_size  # This gives the number of quantization vectors
-        except Exception as e:
-            self.vocab_size = None
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.dim = n_mels
+
+        self.mel_transform = T.MelSpectrogram(
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            n_mels=self.n_mels,
+            normalized=False,
+            center=True,
+            power=1.0
+        ).to(self.device)
+
+        # For decoding: Griffin-Lim inversion
+        self.griffin_lim = T.GriffinLim(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            power=1.0,
+            n_iter=128
+        ).to(self.device)
+
+        self.channels = 1  # Single mel channel
 
     def encode(self, wav_path: str) -> torch.Tensor:
-        """
-        Encode audio file into a sequence of quantized tokens.
-
-        Returns:
-            Tensor of shape (T, C) where T is number of time steps,
-            and C is the number of codebooks (quantizers).
-        """
         wav, sr = torchaudio.load(wav_path)
-        wav = convert_audio(wav, sr, self.sample_rate, self.channels)
-        wav = wav.unsqueeze(0).to(self.device)  # (1, C, T)
+        if sr != self.sample_rate:
+            resampler = T.Resample(orig_freq=sr, new_freq=self.sample_rate).to(self.device)
+            wav = resampler(wav)
+        wav = wav.to(self.device)
 
-        with torch.no_grad():
-            encoded_frames = self.model.encode(wav)
-        # encoded_frames is a list of length C (num codebooks)
-        # each element is (B, 1, T) → we squeeze batch and stack as (C, T)
-        codebooks = encoded_frames[0][0]  # Shape: (1, C, T)
-        codebooks = codebooks.squeeze(0).permute(1, 0)  # → (T, C)
-        return codebooks.int().cpu().detach()  # int32 tokens
+        # If stereo, take mean to mono
+        if wav.size(0) > 1:
+            wav = wav.mean(dim=0, keepdim=True)
 
-    def decode(self, tokens: torch.Tensor) -> torch.Tensor:
-        tokens = tokens.to(self.device).int()                      # (T, K)
-        codes  = tokens.transpose(0, 1).unsqueeze(0)               # (1, K, T)
+        mel = self.mel_transform(wav)  # (1, n_mels, T)
+        mel = mel.squeeze(0)           # (n_mels, T)
+        mel = mel.transpose(0,1)       # (T, n_mels)
+        # Optional: apply log compression
+        mel = torch.log1p(mel)
+        return mel.cpu().detach()
 
-        encoded_frames = [(codes, getattr(self, "_last_scale", None))]
-        with torch.no_grad():
-            audio = self.model.decode(encoded_frames)              # (1, C, T)
+    def decode(self, mel: torch.Tensor) -> torch.Tensor:
+        # mel: (T, n_mels)
+        mel = mel.to(self.device).transpose(0, 1)      # (n_mels, T)
+        mel = torch.expm1(mel).unsqueeze(0)            # (1, n_mels, T)
 
-        return audio.squeeze(0).cpu()
+        # --- Make the FB full-rank and use a tolerant driver ---------------
+        mel_to_spec = T.InverseMelScale(
+            n_stft=self.n_fft // 2 + 1,
+            n_mels=self.n_mels,
+            sample_rate=self.sample_rate,
+            f_min=0.0,
+            # pull f_max a bit *below* Nyquist so the last filter is non-zero
+            f_max=self.sample_rate / 2 - 1.0,
+            norm="slaney",                 # match your MelSpectrogram
+            mel_scale="htk",               # also match           (default is "htk")
+            driver="gelsy"                 # LAPACK driver that tolerates rank-loss
+        ).to(self.device)
+        # -------------------------------------------------------------------
+
+        spec = mel_to_spec(mel)           # (1, n_freq, T)
+        spec = spec.squeeze(0)            # (n_freq, T)
+
+        wav  = self.griffin_lim(spec).unsqueeze(0)     # (1, T)
+        print(wav.shape)
+        return wav.cpu()
+
+

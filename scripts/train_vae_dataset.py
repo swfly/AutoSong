@@ -4,7 +4,8 @@ import os, sys, random, gc
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
-
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, StepLR
+import math
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.audio_encoder import AudioEncoder
@@ -49,13 +50,14 @@ def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, 
 DATASET_DIR        = "dataset"
 DATASET_INST_DIR   = "dataset_inst"
 DATASET_VOCAL_DIR  = "dataset_vocal"
-n_songs = 4
 INST_RATE          = 0.0  # 30% epochs use instrumental-only data
 VOCAL_RATE         = 0.0  # 20% epochs use vocal-only data
 
 normal_song_list = get_song_list(DATASET_DIR, max_songs=10000)
 inst_song_list   = get_song_list(DATASET_INST_DIR)
 vocal_song_list  = get_song_list(DATASET_VOCAL_DIR)
+#n_songs = len(normal_song_list)
+n_songs = 1
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
 BATCH_SIZE = 64
@@ -70,32 +72,39 @@ device = (
     else torch.device("cpu")
 )
 
-encoder = AudioEncoder(device=device, sample_rate=24000, bandwidth=6.0)
-VOCAB_SIZE = encoder.vocab_size
+encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 
 # Load a sample just to get codebook count
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
-N_CODEBOOKS = tmp_tokens.shape[1]
 
 model = SegmentVQVAE(
-    vocab_size=VOCAB_SIZE,
-    n_codebooks=N_CODEBOOKS,
-    block_pairs=32,
-    seg_len=SEG_LEN,
-    latent_dim=1024,
-    emb_dim=512,
-    latent_vocab_size=4096,
-    beta=0.2
+    input_dim=encoder.dim,latent_dim=1024,seq_len=SEG_LEN
 ).to(device)
+def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_steps=500_000):
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
 
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    # Warmup scheduler
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    scheduler = StepLR(optimizer, step_size=1000, gamma=0.5)
+    return optimizer, scheduler
+
+
+optimizer, scheduler = build_optimizer_and_scheduler(
+    model, base_lr = 5e-4, warmup_steps=400, total_steps=10000)
 start_epoch = 1
 
 if os.path.exists(CHECKPOINT_PATH):
     print(f"🔁 Loading checkpoint from {CHECKPOINT_PATH}")
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    # optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     # start_epoch = checkpoint.get("epoch", 0) + 1
     print(f"⏩ Resuming from epoch {start_epoch}")
 
@@ -135,22 +144,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
     batch_next = torch.stack(batch_next).to(device)
 
     optimizer.zero_grad()
-    loss, metrics = model(
-        batch_prev, batch_curr, batch_next,
-        zero_second_prob=0.2,
-    )
+    loss, metrics = model.train_ae(batch_prev, batch_curr, batch_next)
     loss.backward()
     optimizer.step()
+    scheduler.step()
 
-    print(f"[Epoch {epoch:04d}] Loss: {metrics['total']:.4f} | Recon: {metrics['recon_loss']:.4f} | VQ: {metrics['vq_loss']:.4f}")
+    print(f"[Epoch {epoch:04d}] Loss: {metrics['total_loss']:.4f} | Recon: {metrics['recon_loss']:.4f}")
 
     if epoch % 200 == 0 or epoch == EPOCHS:
-        with torch.no_grad():
-            z_i, z_v = model.encoder(batch_curr)
-            _, code_ids_i, _ = model.vq_instru(z_i)
-            _, code_ids_v, _ = model.vq_vocal(z_v)
-            print(f"🧱 Instr codes used: {code_ids_i.unique().numel()}, Vocal codes used: {code_ids_v.unique().numel()}")
-
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),

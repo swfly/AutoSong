@@ -4,7 +4,7 @@
 import math
 import os, sys, random, gc
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
+ 
 import torch, torch.nn as nn, torch.optim as optim
 
 from models.text_encoder     import TextEncoder
