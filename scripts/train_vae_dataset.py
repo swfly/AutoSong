@@ -9,10 +9,12 @@ import math
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.audio_encoder import AudioEncoder
-from models.vq_vae import SegmentVQVAE, chunk_encodec_tokens
+from models.vq_vae import SegmentVAE
 import os
 import re
+from typing import List, Tuple
 
+# ───────────────────────── utility ────────────────────────────
 def get_song_list(dataset_dir="dataset", max_songs=None):
     def song_number(s):
         match = re.search(r"song_(\d+)", s)
@@ -41,12 +43,27 @@ def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, 
         tokens = encoder.encode(audio_path).cpu()
         torch.save({"tokens": tokens}, cache_path)
         print(f"💾 Saved cache to {cache_path}")
-
+    
     segments = chunk_encodec_tokens(tokens, SEG_LEN)
     if len(segments) < 3:
         return []
     return [(segments[i], segments[i+1], segments[i+2]) for i in range(len(segments) - 2)]
 
+
+def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
+    """
+    Split a (T, C) token grid into fixed-length segments, zero-padding the last.
+    """
+    T, C = tokens.shape
+    num_seg = math.ceil(T / seg_len)
+    pad = seg_len * num_seg - T
+    if pad:
+        pad_tensor = torch.zeros(pad, C, dtype=tokens.dtype, device=tokens.device)
+        tokens = torch.cat([tokens, pad_tensor], 0)
+    return list(tokens.view(num_seg, seg_len, C))
+
+
+# ─────────────────────── setups ─────────────────────── #
 DATASET_DIR        = "dataset"
 DATASET_INST_DIR   = "dataset_inst"
 DATASET_VOCAL_DIR  = "dataset_vocal"
@@ -56,11 +73,11 @@ VOCAL_RATE         = 0.0  # 20% epochs use vocal-only data
 normal_song_list = get_song_list(DATASET_DIR, max_songs=10000)
 inst_song_list   = get_song_list(DATASET_INST_DIR)
 vocal_song_list  = get_song_list(DATASET_VOCAL_DIR)
-#n_songs = len(normal_song_list)
-n_songs = 1
+n_songs = len(normal_song_list)
+# n_songs = 1
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 EPOCHS = 100000
 CHECKPOINT_PATH = "checkpoints/vqvae_dataset.pt"
 
@@ -77,9 +94,12 @@ encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 # Load a sample just to get codebook count
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
-model = SegmentVQVAE(
-    input_dim=encoder.dim,latent_dim=1024,seq_len=SEG_LEN
+model = SegmentVAE(
+    input_dim=encoder.dim,latent_dim=16,seq_len=SEG_LEN
 ).to(device)
+discriminator = SpectrogramDiscriminator()
+
+# model = SimpleLinearAE(input_dim=encoder.dim,latent_dim=1024,seq_len=SEG_LEN).to(device)
 def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_steps=500_000):
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
 
@@ -92,12 +112,12 @@ def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_
             return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda)
-    scheduler = StepLR(optimizer, step_size=1000, gamma=0.5)
+    # scheduler = StepLR(optimizer, step_size=1000, gamma=0.5)
     return optimizer, scheduler
 
 
 optimizer, scheduler = build_optimizer_and_scheduler(
-    model, base_lr = 5e-4, warmup_steps=400, total_steps=10000)
+    model, base_lr = 1e-4, warmup_steps=32, total_steps=10000)
 start_epoch = 1
 
 if os.path.exists(CHECKPOINT_PATH):
