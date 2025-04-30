@@ -9,7 +9,8 @@ import math
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.audio_encoder import AudioEncoder
-from models.vq_vae import SegmentVAE
+from models.vq_vae import SegmentVAE, SpectrogramDiscriminator
+from utils.chunk_segments import chunk_segments
 import os
 import re
 from typing import List, Tuple
@@ -44,23 +45,10 @@ def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, 
         torch.save({"tokens": tokens}, cache_path)
         print(f"💾 Saved cache to {cache_path}")
     
-    segments = chunk_encodec_tokens(tokens, SEG_LEN)
+    segments = chunk_segments(tokens, SEG_LEN)
     if len(segments) < 3:
         return []
-    return [(segments[i], segments[i+1], segments[i+2]) for i in range(len(segments) - 2)]
-
-
-def chunk_encodec_tokens(tokens: torch.Tensor, seg_len: int) -> List[torch.Tensor]:
-    """
-    Split a (T, C) token grid into fixed-length segments, zero-padding the last.
-    """
-    T, C = tokens.shape
-    num_seg = math.ceil(T / seg_len)
-    pad = seg_len * num_seg - T
-    if pad:
-        pad_tensor = torch.zeros(pad, C, dtype=tokens.dtype, device=tokens.device)
-        tokens = torch.cat([tokens, pad_tensor], 0)
-    return list(tokens.view(num_seg, seg_len, C))
+    return [(segments[i], segments[i+1], segments[i+2]) for i in range(3, len(segments) - 3)]
 
 
 # ─────────────────────── setups ─────────────────────── #
@@ -77,7 +65,7 @@ n_songs = len(normal_song_list)
 # n_songs = 1
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 EPOCHS = 100000
 CHECKPOINT_PATH = "checkpoints/vqvae_dataset.pt"
 
@@ -95,14 +83,16 @@ encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
 model = SegmentVAE(
-    input_dim=encoder.dim,latent_dim=16,seq_len=SEG_LEN
+    input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
+    network_channel_base=32, seq_len= SEG_LEN
 ).to(device)
-discriminator = SpectrogramDiscriminator()
+discriminator = SpectrogramDiscriminator(1, base_dim = 8).to(device)
+
 
 # model = SimpleLinearAE(input_dim=encoder.dim,latent_dim=1024,seq_len=SEG_LEN).to(device)
 def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_steps=500_000):
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
-
+    optimizer_D = optim.AdamW(discriminator.parameters(), lr=base_lr, weight_decay=1e-5)
     # Warmup scheduler
     def lr_lambda(step):
         if step < warmup_steps:
@@ -112,11 +102,12 @@ def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_
             return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda)
+    scheduler_D = LambdaLR(optimizer_D, lr_lambda)
     # scheduler = StepLR(optimizer, step_size=1000, gamma=0.5)
-    return optimizer, scheduler
+    return optimizer, optimizer_D, scheduler, scheduler_D
 
 
-optimizer, scheduler = build_optimizer_and_scheduler(
+optimizer, optimizer_D, scheduler, scheduler_D = build_optimizer_and_scheduler(
     model, base_lr = 1e-4, warmup_steps=32, total_steps=10000)
 start_epoch = 1
 
@@ -124,12 +115,14 @@ if os.path.exists(CHECKPOINT_PATH):
     print(f"🔁 Loading checkpoint from {CHECKPOINT_PATH}")
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
+    discriminator.load_state_dict(checkpoint["discriminator_state_dict"])
     # optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     # start_epoch = checkpoint.get("epoch", 0) + 1
     print(f"⏩ Resuming from epoch {start_epoch}")
 
 # ─────────────────────── training loop ─────────────────────── #
 print("🚀 Starting full dataset VAE training …")
+criterion = nn.BCELoss()
 for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     triplets = []
@@ -163,25 +156,56 @@ for epoch in range(start_epoch, EPOCHS + 1):
     batch_curr = torch.stack(batch_curr).to(device)
     batch_next = torch.stack(batch_next).to(device)
 
+    # ---- Train Discriminator ----
+    d_loss = 0.0
+    for param in discriminator.parameters():
+        param.requires_grad = True  # Unfreeze discriminator for its update step
+
+    batch_size = batch_curr.size(0)
+    fake_data = model(batch_prev, batch_curr, batch_next)
+    real_labels = torch.ones(batch_size, 1).to(batch_curr.device)
+    fake_labels = torch.zeros(batch_size, 1).to(batch_curr.device)
+    
+    optimizer_D.zero_grad()
+
+    real_preds, inter_data_real = discriminator(batch_curr)
+    fake_preds, inter_data_fake = discriminator(fake_data.detach())  # Detach fake data from generator
+
+    real_loss = criterion(real_preds, real_labels)
+    fake_loss = criterion(fake_preds, fake_labels)
+    d_loss = (real_loss + fake_loss) / 2
+    d_loss.backward()
+    optimizer_D.step()
+
+    # ---- Train Generator ----
+    g_loss = 0.0
+    for param in discriminator.parameters():
+        param.requires_grad = False  # Freeze discriminator for its update step
+
+    # Generator tries to fool the discriminator (maximize discriminator's real prediction for fake data)
+    # fake_data = model(batch_prev, batch_curr, batch_next)
+    fake_preds, inter_data_fake = discriminator(fake_data)
+    real_preds, inter_data_real = discriminator(batch_curr)
+
+    g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
+    error = F.l1_loss(fake_data, batch_curr, reduction='mean')
+    feature_loss = F.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
+    final_loss = g_loss * 0.6 + error * 0.2 + feature_loss * 0.2
+    
     optimizer.zero_grad()
-    loss, metrics = model.train_ae(batch_prev, batch_curr, batch_next)
-    loss.backward()
+    final_loss.backward()
     optimizer.step()
+
+    scheduler_D.step()
     scheduler.step()
 
-    print(f"[Epoch {epoch:04d}] Loss: {metrics['total_loss']:.4f} | Recon: {metrics['recon_loss']:.4f}")
+    print(f"[Epoch {epoch:04d}] Dis Loss: {d_loss:.4f} | Gen Loss: {g_loss:.4f} | Recon Error: {error:.4f}" )
 
     if epoch % 200 == 0 or epoch == EPOCHS:
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "discriminator_state_dict":discriminator.state_dict()
         }, CHECKPOINT_PATH)
         print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
-
-    del batch_prev, batch_curr, batch_next
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-    elif torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    gc.collect()

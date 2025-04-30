@@ -2,11 +2,13 @@ import sys, os
 from pathlib import Path
 import torch
 import torchaudio
+import matplotlib.pyplot as plt
 
 # add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from models.vq_vae import SegmentVQVAE, chunk_encodec_tokens
+from models.vq_vae import SegmentVAE
+from utils.chunk_segments import chunk_segments
 from models.audio_encoder import AudioEncoder
 
 # ─────────────────────────── config ───────────────────────────
@@ -21,19 +23,19 @@ SEG_LEN       = 256  # frames per segment
 OUTPUT_WAV    = "reconstructed_ae.wav"
 
 # ─────────────────────────── load audio encoder ────────────────
-audio_encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)  # ← match training config
-tokens = audio_encoder.encode(AUDIO_IN).to(DEVICE)  # (T_full, C)
+encoder = AudioEncoder(device=torch.device("cpu")) 
+tokens = encoder.encode(AUDIO_IN).to(DEVICE)  # (T_full, C)
 T_full, C = tokens.shape
 
 # ───────────────────────── chunk into segments ─────────────────
-segments = chunk_encodec_tokens(tokens, seg_len=SEG_LEN)  # list of (SEG_LEN, C)
+segments = chunk_segments(tokens, seg_len=SEG_LEN)  # list of (SEG_LEN, C)
 num_segs = len(segments)
 
 # ─────────────────────────── load model ─────────────────────────
-model = SegmentVQVAE(
-    input_dim=C,
-    latent_dim=1024,  # match your training config
-    seq_len=SEG_LEN
+
+model = SegmentVAE(
+    input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
+    network_channel_base=32, seq_len= SEG_LEN
 ).to(DEVICE)
 
 # load checkpoint
@@ -60,24 +62,29 @@ with torch.no_grad():
         z_curr = model.encoder(curr)
         z_next = model.encoder(nxt)
 
+        z = torch.concat([z_prev, z_curr, z_next], dim=1)  # (B, latent_dim * 3)
+        
         # decode
-        recon = model.decoder(z_prev, z_curr, z_next)  # (1, SEG_LEN, C)
-
+        recon = model.decoder(z)  # (1, SEG_LEN, B)
         recon_segments.append(recon.squeeze(0).cpu())  # (SEG_LEN, C)
 
 # flatten back to full sequence length
 recon_tokens = torch.cat(recon_segments, dim=0)  # (num_segs * SEG_LEN, C)
 recon_tokens = recon_tokens[:T_full]             # trim to original length
-
+print(f"✅ Reconstructed")
 # ─────────────────────────── decode audio ───────────────────────
 # Now, decode from reconstructed tokens
-wave = audio_encoder.decode(recon_tokens.to(DEVICE))  # (C_out, T_samples)
-print(wave)
-sample_rate = audio_encoder.sample_rate
-
+wave = encoder.decode(tokens.to(DEVICE))
+# wave = wave.squeeze(0).detach().cpu().numpy()
+# wave2 = encoder.decode(tokens)
+# wave2 = wave2.squeeze(0).detach().cpu().numpy()
+plt.plot(wave.squeeze(0).detach().cpu().numpy(),label="recons")
+# plt.plot(wave2, label="original")
+plt.legend()
+plt.show()
 # make sure output dir exists
 os.makedirs(Path(OUTPUT_WAV).parent, exist_ok=True)
 
 # save
-torchaudio.save(OUTPUT_WAV, wave, sample_rate)
+torchaudio.save(OUTPUT_WAV, wave, encoder.sample_rate)
 print(f"✅ Reconstructed audio saved to {OUTPUT_WAV}")

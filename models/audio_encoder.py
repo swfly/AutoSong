@@ -6,7 +6,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
 class AudioEncoder:
-    def __init__(self, device="cuda", sample_rate=48000, n_mels=128, n_fft=1024, hop_length=256):
+    def __init__(self, device="cuda", sample_rate=48000, n_mels=256, n_fft=2048, hop_length=256):
         self.device = device
         self.sample_rate = sample_rate
         self.n_mels = n_mels
@@ -75,7 +75,6 @@ class AudioEncoder:
         spec = spec.squeeze(0)            # (n_freq, T)
 
         wav  = self.griffin_lim(spec).unsqueeze(0)     # (1, T)
-        print(wav.shape)
         return wav.cpu()
 
 
