@@ -65,7 +65,7 @@ n_songs = len(normal_song_list)
 # n_songs = 1
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 EPOCHS = 100000
 CHECKPOINT_PATH = "checkpoints/vqvae_dataset.pt"
 
@@ -86,7 +86,7 @@ model = SegmentVAE(
     input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
     network_channel_base=32, seq_len= SEG_LEN
 ).to(device)
-discriminator = SpectrogramDiscriminator(1, base_dim = 8).to(device)
+discriminator = SpectrogramDiscriminator(1, base_dim = 12).to(device)
 
 
 # model = SimpleLinearAE(input_dim=encoder.dim,latent_dim=1024,seq_len=SEG_LEN).to(device)
@@ -162,7 +162,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         param.requires_grad = True  # Unfreeze discriminator for its update step
 
     batch_size = batch_curr.size(0)
-    fake_data = model(batch_prev, batch_curr, batch_next)
+    fake_data, vq_loss = model(batch_prev, batch_curr, batch_next)
     real_labels = torch.ones(batch_size, 1).to(batch_curr.device)
     fake_labels = torch.zeros(batch_size, 1).to(batch_curr.device)
     
@@ -190,7 +190,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
     error = F.l1_loss(fake_data, batch_curr, reduction='mean')
     feature_loss = F.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
-    final_loss = g_loss * 0.6 + error * 0.2 + feature_loss * 0.2
+    final_loss = g_loss * 0.3 + error * 0.6 + feature_loss * 0.05 + 0.05 * vq_loss
     
     optimizer.zero_grad()
     final_loss.backward()
