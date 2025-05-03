@@ -62,6 +62,24 @@ with torch.no_grad():
         z_curr = model.encoder(curr)
         z_next = model.encoder(nxt)
 
+
+        C = z_prev.shape[1]
+        z_prev_inst   = z_prev[:, 0:C//2, :, :]
+        z_prev_vocal = z_prev[:, C//2:, :, :]
+
+        z_curr_inst   = z_curr[:, 0:C//2, :, :]
+        z_curr_vocal = z_curr[:, C//2:, :, :]
+
+        z_next_inst   = z_next[:, 0:C//2, :, :]
+        z_next_vocal = z_next[:, C//2:, :, :]
+
+        z_prev_vocal *= 0.0
+        z_curr_vocal *= 0.0
+        z_next_vocal *= 0.0
+
+        z_prev = torch.cat([z_prev_inst, z_prev_vocal], dim=1)  # (B, C, H, W)
+        z_curr = torch.cat([z_curr_inst, z_curr_vocal], dim=1)
+        z_next = torch.cat([z_next_inst, z_next_vocal], dim=1)
         z = torch.concat([z_prev, z_curr, z_next], dim=1)  # (B, latent_dim * 3)
         
         # decode

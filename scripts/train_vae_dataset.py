@@ -9,7 +9,8 @@ import math
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from models.audio_encoder import AudioEncoder
-from models.vq_vae import SegmentVAE, SpectrogramDiscriminator
+# from models.vq_vae import SegmentVAE, SpectrogramDiscriminator
+from models.autoencoder import SegmentAutoEncoder, SpectrogramDiscriminator
 from utils.chunk_segments import chunk_segments
 import os
 import re
@@ -39,7 +40,7 @@ def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, 
         data = torch.load(cache_path, map_location="cpu")
         tokens = data["tokens"]
     else:
-        audio_file = next(f for f in os.listdir(path) if f.endswith((".mp3", ".flac")))
+        audio_file = next(f for f in os.listdir(path) if f.endswith(("wav", ".mp3", ".flac")))
         audio_path = os.path.join(path, audio_file)
         tokens = encoder.encode(audio_path).cpu()
         torch.save({"tokens": tokens}, cache_path)
@@ -55,8 +56,8 @@ def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, 
 DATASET_DIR        = "dataset"
 DATASET_INST_DIR   = "dataset_inst"
 DATASET_VOCAL_DIR  = "dataset_vocal"
-INST_RATE          = 0.0  # 30% epochs use instrumental-only data
-VOCAL_RATE         = 0.0  # 20% epochs use vocal-only data
+INST_RATE          = 0.2  # 30% epochs use instrumental-only data
+VOCAL_RATE         = 0.2  # 20% epochs use vocal-only data
 
 normal_song_list = get_song_list(DATASET_DIR, max_songs=10000)
 inst_song_list   = get_song_list(DATASET_INST_DIR)
@@ -82,7 +83,7 @@ encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 # Load a sample just to get codebook count
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
-model = SegmentVAE(
+model = SegmentAutoEncoder(
     input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
     network_channel_base=32, seq_len= SEG_LEN
 ).to(device)
@@ -127,12 +128,16 @@ for epoch in range(start_epoch, EPOCHS + 1):
     model.train()
     triplets = []
     r = random.random()
+    mask_vocal = False
+    mask_inst = False
     if r < VOCAL_RATE and vocal_song_list:
         mode = "vocal"
+        mask_inst = True
         song_list = vocal_song_list
         base_dir = DATASET_VOCAL_DIR
     elif r < VOCAL_RATE + INST_RATE and inst_song_list:
         mode = "instr"
+        mask_vocal = True
         song_list = inst_song_list
         base_dir = DATASET_INST_DIR
     else:
@@ -162,7 +167,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
         param.requires_grad = True  # Unfreeze discriminator for its update step
 
     batch_size = batch_curr.size(0)
-    fake_data, vq_loss = model(batch_prev, batch_curr, batch_next)
+    fake_data, prior_loss = model(
+        batch_prev, batch_curr, batch_next, 
+        mask_vocal = mask_vocal, mask_inst = mask_inst)
+    
     real_labels = torch.ones(batch_size, 1).to(batch_curr.device)
     fake_labels = torch.zeros(batch_size, 1).to(batch_curr.device)
     
@@ -183,14 +191,13 @@ for epoch in range(start_epoch, EPOCHS + 1):
         param.requires_grad = False  # Freeze discriminator for its update step
 
     # Generator tries to fool the discriminator (maximize discriminator's real prediction for fake data)
-    # fake_data = model(batch_prev, batch_curr, batch_next)
     fake_preds, inter_data_fake = discriminator(fake_data)
     real_preds, inter_data_real = discriminator(batch_curr)
 
     g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
     error = F.l1_loss(fake_data, batch_curr, reduction='mean')
     feature_loss = F.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
-    final_loss = g_loss * 0.3 + error * 0.6 + feature_loss * 0.05 + 0.05 * vq_loss
+    final_loss = g_loss * 0.3 + error * 0.5 + feature_loss * 0.1 + prior_loss * 0.1
     
     optimizer.zero_grad()
     final_loss.backward()

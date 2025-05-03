@@ -6,7 +6,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.gumbel_softmax_quantizer import GumbelSoftmaxQuantizer
 
 
 class ResidualBlock(nn.Module):
@@ -174,78 +173,6 @@ class SegmentDecoder(nn.Module):
         x = self.finalize(x)
         return x.squeeze(1)
 
-# ───────────────────────── VQ ────────────────────────
-class VectorQuantizerEMA(nn.Module):
-    """
-    Compress EACH (H,W) map of every channel into ONE codebook vector,
-    then broadcast it back to (H,W).
-
-    z            : (B, C, H, W)
-    q (returned) : (B, C, H, W)   (straight-through)
-    indices      : (B, C)         discrete token IDs
-    """
-    def __init__(self, num_embeddings, patch_hw, num_channels, commitment_cost=0.25, decay=0.99, eps=1e-5):
-        super().__init__()
-        self.K = num_embeddings
-        self.D = patch_hw
-        self.C = num_channels
-        self.beta = commitment_cost
-        self.decay = decay
-        self.eps = eps
-
-        # Channel-wise codebooks
-        embed = torch.randn(self.C, self.K, self.D)  # (C, K, H*W)
-        self.register_buffer("embedding", embed)
-        self.register_buffer("ema_cluster_size", torch.zeros(self.C, self.K))
-        self.register_buffer("ema_embed_sum", embed.clone())
-
-    def forward(self, z):
-        B, C, H, W = z.shape
-        assert C == self.C and H * W == self.D
-
-        z_flat = z.view(B, C, -1)  # (B, C, H*W)
-        z_flat = z_flat.transpose(0, 1)  # (C, B, D)
-
-        all_indices = []
-        all_quantized = []
-
-        for c in range(self.C):
-            x = z_flat[c]  # (B, D)
-            embed = self.embedding[c]  # (K, D)
-
-            dist = (
-                x.pow(2).sum(1, keepdim=True)
-                - 2 * x @ embed.t()
-                + embed.pow(2).sum(1)
-            )
-            indices = dist.argmin(1)  # (B,)
-            quantized = embed[indices]  # (B, D)
-
-            if self.training:
-                onehot = F.one_hot(indices, self.K).type_as(x)
-                n_i = onehot.sum(0).detach()
-                e_i = onehot.t() @ x.detach()
-
-                self.ema_cluster_size[c].mul_(self.decay).add_(n_i, alpha=1 - self.decay)
-                self.ema_embed_sum[c].mul_(self.decay).add_(e_i, alpha=1 - self.decay)
-
-                n_tot = self.ema_cluster_size[c].sum()
-                smoothed_n = (self.ema_cluster_size[c] + self.eps) / (
-                    n_tot + self.K * self.eps
-                ) * n_tot
-                self.embedding[c].copy_(self.ema_embed_sum[c] / smoothed_n.unsqueeze(1))
-
-            all_indices.append(indices)
-            all_quantized.append(quantized)
-
-        quantized = torch.stack(all_quantized, dim=1)  # (B, C, D)
-        quantized = quantized.view(B, C, H, W)
-        indices = torch.stack(all_indices, dim=1)  # (B, C)
-
-        commit_loss = F.mse_loss(quantized.detach(), z)
-        q_st = z + (quantized - z).detach()
-
-        return q_st, self.beta * commit_loss, indices
     
 # ───────────────────────── VAE wrapper ─────────────────────
 class SpectrogramDiscriminator(nn.Module):
@@ -273,7 +200,7 @@ class SpectrogramDiscriminator(nn.Module):
         x = self.fc(x)
         return self.sigmoid(x), y  # Output probability for real or fake
 
-class SegmentVAE(nn.Module):
+class SegmentAutoEncoder(nn.Module):
     def __init__(
         self,
         input_dim:int=128,
@@ -292,20 +219,6 @@ class SegmentVAE(nn.Module):
         self.decoder = SegmentDecoder(
             output_size=(seq_len, input_dim), input_size=latent_size, 
             input_channels=feature_channels*3, output_channels=1, base_dim = network_channel_base + network_channel_base//2
-        )
-
-        self.vq_inst = VectorQuantizerEMA(
-        num_embeddings = 1024,
-        patch_hw       = latent_size[0] * latent_size[1],   # 256 in this example
-        num_channels = feature_channels // 2,
-        # hard=False
-        )
-
-        self.vq_vocal = VectorQuantizerEMA(
-        num_embeddings = 1024,
-        patch_hw       = latent_size[0] * latent_size[1],   # 256 in this example
-        num_channels = feature_channels // 2,
-        # hard = False
         )
 
     # ─────────────────── forward ────────────────────:
@@ -341,59 +254,20 @@ class SegmentVAE(nn.Module):
             z_curr_inst *= 0.0
             z_next_inst *= 0.0
 
-        ae_only = False
-        if ae_only:
-            z_prev_q_inst = z_prev_inst
-            z_curr_q_inst = z_curr_inst
-            z_next_q_inst = z_next_inst
-
-            z_prev_q_vocal = z_prev_vocal
-            z_curr_q_vocal = z_curr_vocal
-            z_next_q_vocal = z_next_vocal
-            vq_loss = 0.0
-        else:
-            z_prev_q_inst, prev_vq_loss, token_prev = self.vq_inst(z_prev_inst)
-            z_curr_q_inst, curr_vq_loss, token_curr = self.vq_inst(z_curr_inst)
-            z_next_q_inst, next_vq_loss, token_next = self.vq_inst(z_next_inst)
-
-            vq_loss = prev_vq_loss+curr_vq_loss+next_vq_loss
-
-            z_prev_q_vocal, prev_vq_loss, token_prev = self.vq_vocal(z_prev_vocal)
-            z_curr_q_vocal, curr_vq_loss, token_curr = self.vq_vocal(z_curr_vocal)
-            z_next_q_vocal, next_vq_loss, token_next = self.vq_vocal(z_next_vocal)
-
-            vq_loss += prev_vq_loss+curr_vq_loss+next_vq_loss
-
-        z_prev_q = torch.cat([z_prev_q_inst, z_prev_q_vocal], dim=1)  # (B, C, H, W)
-        z_curr_q = torch.cat([z_curr_q_inst, z_curr_q_vocal], dim=1)
-        z_next_q = torch.cat([z_next_q_inst, z_next_q_vocal], dim=1)
-
-        z = torch.concat([z_prev_q, z_curr_q, z_next_q], dim=1)  # (B, latent_dim * 3)
-
-        recon = self.decoder(z)  # (B, T, D)
-        return recon, vq_loss
-    
-    def train_ae(
-        self,
-        tokens_prev: torch.Tensor,
-        tokens_curr: torch.Tensor,
-        tokens_next: torch.Tensor,
-    ):
-        z_prev = self.encoder(tokens_prev) 
-        z_curr = self.encoder(tokens_curr)
-        z_next = self.encoder(tokens_next)
+        z_prev = torch.cat([z_prev_inst, z_prev_vocal], dim=1)  # (B, C, H, W)
+        z_curr = torch.cat([z_curr_inst, z_curr_vocal], dim=1)
+        z_next = torch.cat([z_next_inst, z_next_vocal], dim=1)
 
         z = torch.concat([z_prev, z_curr, z_next], dim=1)  # (B, latent_dim * 3)
         recon = self.decoder(z)  # (B, T, D)
 
-        # 5. Compute reconstruction loss
-        recon_loss = F.l1_loss(recon, tokens_curr, reduction='mean')
-        # perceptual_loss = self.perceptual_loss_fn(recon, tokens_curr)
+        # prior loss for stable latent distribution
+        mu = z.mean(dim=0)
+        std = z.std(dim=0)
 
-        total_loss = recon_loss
+        mean_loss = (mu ** 2).mean()         # mean → 0
+        std_loss = ((std - 1) ** 2).mean()   # std → 1
+        prior_loss = mean_loss + std_loss
 
-        return total_loss, {
-            "recon_loss": recon_loss.detach(),
-            "total_loss": total_loss.detach()
-        }
+        return recon, prior_loss
 
