@@ -109,7 +109,7 @@ def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_
 
 
 optimizer, optimizer_D, scheduler, scheduler_D = build_optimizer_and_scheduler(
-    model, base_lr = 1e-4, warmup_steps=32, total_steps=10000)
+    model, base_lr = 1e-4, warmup_steps=32, total_steps=EPOCHS)
 start_epoch = 1
 
 if os.path.exists(CHECKPOINT_PATH):
