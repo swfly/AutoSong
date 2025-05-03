@@ -66,7 +66,7 @@ n_songs = len(normal_song_list)
 # n_songs = 1
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 EPOCHS = 100000
 CHECKPOINT_PATH = "checkpoints/vqvae_dataset.pt"
 
