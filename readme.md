@@ -134,4 +134,4 @@ We can consider scaling the network and training on more diverse tracks.
 
 Machine learning and generative modeling are no joke.  
 Everything feels obvious in hindsight, but incredibly hard when you're stuck.  
-This process — of hitting walls, debugging ideas, and slowly forming intuition — is what makes research difficult… and meaningful.
+This process — of hitting walls, debugging ideas, and slowly forming intuition — is what makes research difficult and meaningful.

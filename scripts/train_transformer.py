@@ -119,6 +119,7 @@ def load_random_song():
     lat = torch.stack(lat_list, dim=0)  # [S,C,H,W]
     return lyr_emb, lat
 
+# When loading in batch, truncates the longer tracks to the shortest size
 def load_batch(bs=BATCH_SIZE):
     lyr_batch, lat_batch = [], []
     while len(lat_batch) < bs:
@@ -136,17 +137,17 @@ def load_batch(bs=BATCH_SIZE):
 print("🚀 Starting training …")
 os.makedirs(os.path.dirname(TRANS_CKPT), exist_ok=True)
 
-min_len = 128
-max_len = MAX_SEQ_LEN
-step = 60000000000     # how often to grow
-
+# min_len = 256
+# max_len = MAX_SEQ_LEN
+# step = 60000000000     # how often to grow
+training_sequence_length = MAX_SEQ_LEN
 train_losses = []
 for epoch in range(start_epoch, EPOCHS + 1):
     txf.train()
     opt.zero_grad(set_to_none=True)
 
     lyrics, z = load_batch()
-    training_sequence_length = min(z.shape[1], max_len, min_len * (2 ** (epoch // step)))
+    # training_sequence_length = min(z.shape[1], max_len, min_len * (2 ** (epoch // step)))
     T = z.shape[1]
     if T > training_sequence_length:
         start = torch.randint(0, T - training_sequence_length + 1, (1,)).item()
@@ -162,52 +163,52 @@ for epoch in range(start_epoch, EPOCHS + 1):
     loss_lat = nn.functional.l1_loss(pred[:, :-1] - z[:, :-1], z[:, 1:] - z[:,:-1], reduction="mean")
 
     # # -------- perceptual & adversarial --------
-    # # pred, z_tgt : [B, S, C, D]   (with S ≥ 3)
-    # B, S, C, H, W = pred.shape
-    # half = C // 2          # 2 channels per split
+    # pred, z_tgt : [B, S, C, D]   (with S ≥ 3)
+    B, S, C, H, W = pred.shape
+    half = C // 2          # 2 channels per split
     
-    # rand_idx = torch.randint(low=1, high=S-1, size=(B,))
-    # triplets_pred = []
-    # triplets_real = []
+    rand_idx = torch.randint(low=1, high=S-1, size=(B,))
+    triplets_pred = []
+    triplets_real = []
 
-    # for b in range(B):
-    #     i = rand_idx[b]
-    #     triplets_pred.append(torch.cat([
-    #         pred[b, i - 1], pred[b, i], pred[b, i + 1]
-    #     ], dim=0))  # [3*C, D]
+    for b in range(B):
+        i = rand_idx[b]
+        triplets_pred.append(torch.cat([
+            pred[b, i - 1], pred[b, i], pred[b, i + 1]
+        ], dim=0))  # [3*C, D]
 
-    #     triplets_real.append(torch.cat([
-    #         z_tgt[b, i - 1], z_tgt[b, i], z_tgt[b, i + 1]
-    #     ], dim=0))  # [3*C, D]
+        triplets_real.append(torch.cat([
+            z_tgt[b, i - 1], z_tgt[b, i], z_tgt[b, i + 1]
+        ], dim=0))  # [3*C, D]
 
-    # pred_flat = torch.stack(triplets_pred).view(B, 3*C, H, W)  # [B, 3C, H, W]
-    # tgt_flat  = torch.stack(triplets_real).view(B, 3*C, H, W)
+    pred_flat = torch.stack(triplets_pred).view(B, 3*C, H, W)  # [B, 3C, H, W]
+    tgt_flat  = torch.stack(triplets_real).view(B, 3*C, H, W)
 
-    # # ----- decode to mel -----
-    # mel_pred = ae.decoder(pred_flat)              # [(B*(S-2)), seg_len, mel_bins]
-    # mel_real = ae.decoder(tgt_flat)
+    # ----- decode to mel -----
+    mel_pred = ae.decoder(pred_flat)              # [(B*(S-2)), seg_len, mel_bins]
+    mel_real = ae.decoder(tgt_flat)
 
-    # # ----- discriminator features & verdict -----
-    # disc_fake, feat_fake = disc(mel_pred)
-    # disc_real, feat_real = disc(mel_real)
+    # ----- discriminator features & verdict -----
+    disc_fake, feat_fake = disc(mel_pred)
+    disc_real, feat_real = disc(mel_real)
 
-    # # feature-matching loss
-    # loss_feat = nn.functional.l1_loss(feat_fake, feat_real, reduction="mean")
+    # feature-matching loss
+    loss_feat = nn.functional.l1_loss(feat_fake, feat_real, reduction="mean")
 
-    # # adversarial loss (generator wants 'real' label)
-    # real_lbl = torch.ones_like(disc_fake)
-    # loss_adv = nn.functional.binary_cross_entropy(disc_fake, real_lbl)
+    # adversarial loss (generator wants 'real' label)
+    real_lbl = torch.ones_like(disc_fake)
+    loss_adv = nn.functional.binary_cross_entropy(disc_fake, real_lbl)
 
-    # # -------- total loss --------
-    # # loss = loss_lat + λ_FEAT * loss_feat + λ_ADV * loss_adv
-    # loss = loss_lat + λ_FEAT * loss_feat
-    loss = loss_lat
+    # -------- total loss --------
+    # loss = loss_lat + λ_FEAT * loss_feat + λ_ADV * loss_adv
+    loss = loss_lat + λ_FEAT * loss_feat
+    # loss = loss_lat
     loss.backward()
     opt.step()
     sched.step()
     train_losses.append(loss.item())
-    print(f"[{epoch:04d}] L1 {loss_lat:.4f}")
-    # print(f"[{epoch:04d}] L1 {loss_lat:.4f} | Feat {loss_feat:.4f} | Adv {loss_adv:.4f}")
+    # print(f"[{epoch:04d}] L1 {loss_lat:.4f}")
+    print(f"[{epoch:04d}] L1 {loss_lat:.4f} | Feat {loss_feat:.4f} | Adv {loss_adv:.4f}")
 
     # --- optional live viz every 1000 steps ---
     # if epoch % 1 == 0:

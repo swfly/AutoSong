@@ -13,6 +13,84 @@ def build_causal_mask(t: int, device: torch.device = torch.device("cpu"), dtype:
     """Upper‑triangular (t×t) mask with 0 on diag / -inf above it (causal). Cached on CPU by default."""
     return torch.triu(torch.full((t, t), float("-inf"), device=device, dtype=dtype), diagonal=1)
 
+# ─────────────────────── planner ───────────────────────
+class LyricPlanner(nn.Module):
+    """
+    Learned‑query planner:
+        lyric tokens ─► Encoder │
+                               │─► Decoder(query_tokens) ─► N_plan semantic vectors
+    """
+
+    def __init__(
+        self,
+        vocab_size:     int,
+        num_plan_tokens:int  = 64,
+        d_plan:         int  = 512,
+        n_heads:        int  = 8,
+        n_enc_layers:   int  = 4,
+        n_dec_layers:   int  = 2,
+        dropout:        float= 0.1,
+        max_text_len:   int  = 512,
+    ):
+        super().__init__()
+        self.num_plan_tokens = num_plan_tokens
+
+        # ── token & position embeddings ───────────────────────────────
+        self.text_emb = nn.Embedding(vocab_size, d_plan)
+        self.pos_emb  = nn.Parameter(torch.randn(1, max_text_len, d_plan))
+
+        # ── encoder over lyric sequence ───────────────────────────────
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model        = d_plan,
+            nhead          = n_heads,
+            dim_feedforward= 4 * d_plan,
+            dropout        = dropout,
+            activation     = "gelu",
+            batch_first    = True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, n_enc_layers)
+
+        # ── learned planner query tokens ──────────────────────────────
+        self.plan_queries = nn.Parameter(torch.randn(1, num_plan_tokens, d_plan))
+        self.plan_pos     = nn.Parameter(torch.randn(1, num_plan_tokens, d_plan))
+
+        # ── decoder: queries attend to encoded lyrics ─────────────────
+        if n_dec_layers > 0:
+            dec_layer = nn.TransformerDecoderLayer(
+                d_model        = d_plan,
+                nhead          = n_heads,
+                dim_feedforward= 4 * d_plan,
+                dropout        = dropout,
+                activation     = "gelu",
+                batch_first    = True,
+            )
+            self.decoder = nn.TransformerDecoder(dec_layer, n_dec_layers)
+        else:
+            # fallback: single MHA layer (queries→memory) if you set n_dec_layers=0
+            self.decoder = None
+            self.attn = nn.MultiheadAttention(d_plan, n_heads, batch_first=True)
+
+    # ─────────────────────────── forward ────────────────────────────
+    def forward(self, text_ids: torch.Tensor) -> torch.Tensor:
+        """
+        text_ids : (B, T_text)
+        returns  : (B, N_plan, d_plan)
+        """
+        B, T = text_ids.shape
+        enc_in = self.text_emb(text_ids) + self.pos_emb[:, :T]      # (B,T,D)
+        memory = self.encoder(enc_in)                               # (B,T,D)
+
+        # broadcast learned queries to batch
+        queries = self.plan_queries.expand(B, -1, -1) + self.plan_pos
+
+        if self.decoder is not None:                                # full decoder
+            plan = self.decoder(tgt=queries, memory=memory)         # (B,N,D)
+        else:                                                       # single MHA
+            plan, _ = self.attn(queries, memory, memory,
+                                need_weights=False)                 # (B,N,D)
+
+        return plan
+    
 # ─────────────────────── building blocks ───────────────────────
 
 class DecoderLayer(nn.Module):
@@ -78,9 +156,15 @@ class SoundTransformerContinuous(nn.Module):
         nn.init.normal_(self.time_pos, std=1.0)
 
         vocab = vocab_mod.generate_pinyin_vocab()
-        self.text_emb  = nn.Embedding(len(vocab), d_model)
-        self.text_pos = nn.Parameter(torch.empty(1, max_text_len, d_model))
-        nn.init.normal_(self.text_pos, std=1.0)
+        self.planner = LyricPlanner(
+            vocab_size      = len(vocab),
+            num_plan_tokens = max_seq_len // 4,   # or any density you prefer
+            d_plan          = d_model,            # keep equal → no projection needed
+            n_heads         = d_model // 64,
+            n_enc_layers    = 2,                  # lyric encoder depth
+            n_dec_layers    = 2,                  # planner decoder depth  (set 0 => single MHA)
+            max_text_len    = max_text_len,
+        )
 
         self.token_proj = nn.Sequential(
             nn.Linear(in_channels * H * W, 4 * d_model),  # scale up to 4 * d_model
@@ -115,6 +199,9 @@ class SoundTransformerContinuous(nn.Module):
         B, S, C, H, W = latents.shape
         assert (H, W) == (self.H, self.W) and C == self.C, "latent shape mismatch"
 
+        # a) ── planner memory ───────────────────────────────────────────
+        plan_mem = self.planner(text_ids)                 # (B,N_plan,d_plan)
+
         # latents are now [B, S, C, H, W]
         # apply channel embedding and time embedding to the latents
         latents_reshaped = latents.view(B, S, C, H * W)  # [B, S, C, H*W]
@@ -127,13 +214,11 @@ class SoundTransformerContinuous(nn.Module):
 
         # Project the embedded vectors to target dimension
         tokens = self.token_proj(tokens)
-        # text memory (add pos‑emb)
-        mem = self.text_emb(text_ids) + self.text_pos[:, : text_ids.size(1)]
         # causal transformer
         L = tokens.size(1)
         mask = self._causal_mask[:L, :L].to(latents.device)
         for blk in self.blocks:
-            tokens = blk(tokens, mem, mask)
+            tokens = blk(tokens, plan_mem, mask)
 
         # Project tokens back to latent patch shape
         tokens = self.recon_proj(tokens)  # [B, S, C*H*W]

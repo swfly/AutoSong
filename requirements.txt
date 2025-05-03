@@ -1,5 +1,16 @@
-torch
-transformers
-torchaudio
-pypinyin
-encodec @ git+https://github.com/facebookresearch/encodec
+# ───────── Core deep‑learning stack ─────────
+torch==2.1.0                      # pip install torch==2.1.0+cu118 -f https://download.pytorch.org/whl/torch_stable.html  for CUDA11.8
+torchaudio==2.1.0                 # same index‑url as above for CUDA builds
+
+# ───────── Utility / training helpers ───────
+tqdm>=4.66.0
+matplotlib>=3.8.0                 # used in utils/*.py for loss & latent visualizers
+
+# ───────── NLP preprocessing ────────────────
+pypinyin>=0.50.0                  # pinyin tokeniser in models/text_encoder.py
+
+# ───────── Audio post‑processing & conversion ─
+pydub>=0.25.1                     # FLAC→WAV converter (requires system ffmpeg)
+
+# (Optional) experiment tracking
+wandb>=0.16.0                     # uncomment if you enable logging
