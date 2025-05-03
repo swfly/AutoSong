@@ -192,6 +192,7 @@ class SegmentEncoder(nn.Module):
         for blk in self.blocks:
             y = blk(y)
         y = self.finalize(y)         # (B,C,H,W)
+        return y
         return self.fuse(query_map=y, context_seq=x)
 
 
@@ -259,7 +260,7 @@ class SegmentDecoder(nn.Module):
         returns mel: (B, T, M)
         """
         y = self.initialize(x)          # (B, base_dim, H, W)
-        y = self.self_attn(y, None)     # self-attn
+        # y = self.self_attn(y, None)     # self-attn
         for blk in self.blocks:
             y = blk(y)
         mel = self.finalize(y).squeeze(1)  # (B, T, M)
