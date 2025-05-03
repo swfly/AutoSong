@@ -10,7 +10,7 @@ def clear_cached_encodings(dataset_dirs):
             continue
         for root, dirs, files in os.walk(dataset_dir):
             for file in files:
-                if file == "cached_encoding.pt":
+                if file == "cached_encoding.pt" or file == "cached_latents.pt":
                     file_path = os.path.join(root, file)
                     try:
                         os.remove(file_path)
