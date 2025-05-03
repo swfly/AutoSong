@@ -348,12 +348,12 @@ class SegmentAutoEncoder(nn.Module):
 
         track_loss = 0.0
         if mask_vocal:
-            track_loss = F.mse_loss(z_prev_vocal) + F.mse_loss(z_curr_vocal) + F.mse_loss(z_next_vocal) 
+            track_loss = (z_prev_vocal**2).mean() + (z_curr_vocal**2).mean() + (z_next_vocal**2).mean()
             z_prev_vocal *= 0.0
             z_curr_vocal *= 0.0
             z_next_vocal *= 0.0
         if mask_inst:
-            track_loss = F.mse_loss(z_prev_inst) + F.mse_loss(z_curr_inst) + F.mse_loss(z_next_inst)
+            track_loss = (z_prev_inst**2).mean() + (z_curr_inst**2).mean() + (z_next_inst**2).mean()
             z_prev_inst *= 0.0
             z_curr_inst *= 0.0
             z_next_inst *= 0.0
