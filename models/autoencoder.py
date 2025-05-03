@@ -208,6 +208,7 @@ class SegmentEncoder(nn.Module):
             y = block(y)
         
         y = self.finalize(y)
+        return y
         return self.fuse(query_map=y, context_seq=x)
 
 
@@ -266,7 +267,7 @@ class SegmentDecoder(nn.Module):
         x: (B, C, W, H)  -> output (B, 1, W', H')
         """
         x = self.initialize(x)
-        x = self.self_attn(x, None)     # self-attn
+        # x = self.self_attn(x, None)     # self-attn
 
         for block in self.blocks:
             x = block(x)
