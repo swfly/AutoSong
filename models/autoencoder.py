@@ -208,7 +208,6 @@ class SegmentEncoder(nn.Module):
             y = block(y)
         
         y = self.finalize(y)
-        return y
         return self.fuse(query_map=y, context_seq=x)
 
 
@@ -267,7 +266,7 @@ class SegmentDecoder(nn.Module):
         x: (B, C, W, H)  -> output (B, 1, W', H')
         """
         x = self.initialize(x)
-        # x = self.self_attn(x, None)     # self-attn
+        x = self.self_attn(x, None)     # self-attn
 
         for block in self.blocks:
             x = block(x)
@@ -347,11 +346,14 @@ class SegmentAutoEncoder(nn.Module):
         z_next_inst   = z_next[:, 0:C//2, :, :]
         z_next_vocal = z_next[:, C//2:, :, :]
 
+        track_loss = 0.0
         if mask_vocal:
+            track_loss = F.mse_loss(z_prev_vocal) + F.mse_loss(z_curr_vocal) + F.mse_loss(z_next_vocal) 
             z_prev_vocal *= 0.0
             z_curr_vocal *= 0.0
             z_next_vocal *= 0.0
         if mask_inst:
+            track_loss = F.mse_loss(z_prev_inst) + F.mse_loss(z_curr_inst) + F.mse_loss(z_next_inst)
             z_prev_inst *= 0.0
             z_curr_inst *= 0.0
             z_next_inst *= 0.0
@@ -369,7 +371,7 @@ class SegmentAutoEncoder(nn.Module):
 
         mean_loss = (mu ** 2).mean()         # mean → 0
         std_loss = ((std - 1) ** 2).mean()   # std → 1
-        prior_loss = mean_loss + std_loss
+        prior_loss = mean_loss + std_loss + track_loss
 
         return recon, prior_loss
 
