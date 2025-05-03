@@ -1,11 +1,12 @@
-# models/vq_vae.py
+# 📄 models/vq_vae.py
+
 from __future__ import annotations
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ─────────────────────── Attention Utility ───────────────────────
 
 class CrossAttn2d(nn.Module):
     """
@@ -87,242 +88,250 @@ class CrossAttn2d(nn.Module):
         out_map = out.permute(0, 2, 1).view(B, C, H, W)   # (B, C, H, W)
         return query_map + self.resid_sc * out_map
 
-
-# ───────────────────────── CNN Blocks ─────────────────────────
-
 class ResidualBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, stride=1):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.conv1    = nn.Conv2d(in_ch, out_ch, 5, stride=stride, padding=2)
-        self.norm1    = nn.InstanceNorm2d(out_ch, affine=True)
-        self.conv2    = nn.Conv2d(out_ch, out_ch, 5, padding=2)
-        self.norm2    = nn.InstanceNorm2d(out_ch, affine=True)
-        self.shortcut = (nn.Conv2d(in_ch, out_ch, 1, stride=stride)
-                         if (in_ch!=out_ch or stride!=1) else nn.Identity())
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 5, stride=stride, padding=2)
+        self.norm1 = nn.InstanceNorm2d(out_channels, affine = True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 5, stride=1, padding=2)
+        self.norm2 = nn.InstanceNorm2d(out_channels, affine = True)
+        
+        if in_channels != out_channels or stride != 1:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, 1, stride=stride)
+        else:
+            self.shortcut = nn.Identity()
 
     def forward(self, x):
-        iden = self.shortcut(x)
-        out  = F.gelu(self.norm1(self.conv1(x)))
-        out  = F.gelu(self.norm2(self.conv2(out)))
-        return F.gelu(out + iden)
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = F.gelu(out)
+
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = F.gelu(out)
+        
+        out += identity
+        out = F.gelu(out)
+        return out
 
 class ResidualBlockUp(nn.Module):
-    def __init__(self, in_ch, out_ch, scale_factor=(2,2)):
+    def __init__(self, in_channels, out_channels, scale_factor=(2,2)):
         super().__init__()
-        self.scale    = scale_factor
-        self.conv1    = nn.Conv2d(in_ch, out_ch, 5, padding=2)
-        self.norm1    = nn.InstanceNorm2d(out_ch, affine=True)
-        self.conv2    = nn.Conv2d(out_ch, out_ch, 5, padding=2)
-        self.norm2    = nn.InstanceNorm2d(out_ch, affine=True)
-        self.shortcut = (nn.Conv2d(in_ch, out_ch, 1)
-                         if in_ch!=out_ch else nn.Identity())
+        self.scale_factor = scale_factor
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 5, stride=1, padding=2)
+        self.norm1 = nn.InstanceNorm2d(out_channels, affine = True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 5, stride=1, padding=2)
+        self.norm2 = nn.InstanceNorm2d(out_channels, affine = True)
+
+        if in_channels != out_channels:
+            self.shortcut_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.shortcut_conv = nn.Identity()
 
     def forward(self, x):
-        iden = F.interpolate(x, scale_factor=self.scale, mode='bilinear', align_corners=False)
-        iden = self.shortcut(iden)
-        out  = F.interpolate(x, scale_factor=self.scale, mode='bilinear', align_corners=False)
-        out  = F.gelu(self.norm1(self.conv1(out)))
-        out  = F.gelu(self.norm2(self.conv2(out)))
-        return F.gelu(out + iden)
+        identity = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
+        identity = self.shortcut_conv(identity)
 
+        out = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
+        
+        out = self.conv1(out)
+        out = self.norm1(out)
+        out = F.gelu(out)
 
-# ───────────────────────── Encoder ────────────────────────────
-
+        out = self.conv2(out)
+        out = self.norm2(out)
+        out = F.gelu(out)
+        
+        out += identity
+        out = F.gelu(out)
+        return out
+    
+# ───────────────────────── encoder ────────────────────────
 class SegmentEncoder(nn.Module):
-    """
-    CNN encoder + cross-attention fusion.
-    Input:  x ∈ ℝ^{B×T×M}   (e.g. 256×256 mel)
-    Output: z ∈ ℝ^{B×C×H×W}
-    """
-    def __init__(
-        self,
-        input_size:      tuple[int,int],  # (T, M) mel dims
-        output_size:     tuple[int,int],  # (H, W) latent spatial dims
-        output_channels: int,             # C
-        base_dim:        int = 32,
-        max_dim:         int = 512,
-    ):
+    def __init__(self, input_size, output_size, output_channels, base_dim=32, max_dim=512):
         super().__init__()
-        T, M = input_size
-        H, W = output_size
+        
+        # Initialize the input and output sizes
+        self.input_size = input_size
+        self.output_size = output_size
+        self.output_channels = output_channels
+        
+        self.initialize = nn.Conv2d(1, base_dim, kernel_size = 1)
 
-        # 1) first conv
-        self.initialize = nn.Conv2d(1, base_dim, 1)
+        # Automatically calculate the number of residual blocks and their parameters
+        self.blocks, out_dim = self.create_residual_blocks(input_size, output_size, base_dim, max_dim)
+        
+        # Final convolution to reduce channels to output_channels
+        self.finalize = nn.Conv2d(out_dim, output_channels, kernel_size=1)
 
-        # 2) downsampling blocks
-        self.blocks, ch = self._make_blocks(base_dim, input_size, output_size, base_dim, max_dim)
-
-        # 3) project to C channels
-        self.finalize = nn.Conv2d(ch, output_channels, 1)
-
-        # 4) cross-attn fusion: mel_dim=M → C, map H×W
         self.fuse = CrossAttn2d(
             d_model         = output_channels,
             num_heads       = 1,
-            height          = H,
-            width           = W,
-            mel_dim         = M,
-            max_context_len = T,
+            height          = output_size[0],
+            width           = output_size[1],
+            mel_dim         = input_size[1],
+            max_context_len = input_size[0],
             resid_scale     = 0.5,
         )
 
-    def _make_blocks(self, in_ch, in_size, out_size, base_dim, max_dim):
+    def create_residual_blocks(self, input_size, output_size, base_dim, max_dim):
+        # Calculate the necessary strides and channel expansions
+        in_channels = base_dim  # Starting with 1 channel (grayscale input)
+        current_size = input_size
         blocks = nn.ModuleList()
-        curr_ch, (h, w) = in_ch, in_size
-        H_out, W_out    = out_size
-        while h > H_out or w > W_out:
-            sh = 2 if h > H_out else 1
-            sw = 2 if w > W_out else 1
-            out_ch = min(base_dim*2, max_dim)
-            blk    = ResidualBlock(curr_ch, out_ch, stride=(sh, sw))
-            blocks.append(blk)
-            curr_ch = out_ch
-            h       = math.ceil(h / sh)
-            w       = math.ceil(w / sw)
-        return blocks, curr_ch
+        
+        # Keep doubling the channels and reducing the spatial size until we reach the target output size
+        while current_size[0] > output_size[0] or current_size[1] > output_size[1]:
+            stride_h = 2 if current_size[0] > output_size[0] else 1
+            stride_w = 2 if current_size[1] > output_size[1] else 1
+            
+            out_channels = min(base_dim * 2, max_dim)  # Limit channel growth to max_dim
+            block = ResidualBlock(in_channels, out_channels, stride=(stride_h, stride_w))
+            blocks.append(block)
+            
+            # Update in_channels and current_size after applying the block
+            in_channels = out_channels
+            current_size = (math.ceil(current_size[0] / stride_h), math.ceil(current_size[1] / stride_w))
+        
+        return blocks, in_channels
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        x : (B, T, M)
-        returns z: (B, C, H, W)
+        x: (B, W, H)  -> output (B, W', H')
         """
-        B, T, M = x.shape
-        y = x.unsqueeze(1)           # (B,1,T,M)
+        y = x.unsqueeze(1)  # (B, 1, W, H)
         y = self.initialize(y)
-        for blk in self.blocks:
-            y = blk(y)
-        y = self.finalize(y)         # (B,C,H,W)
-        return y
+
+        for block in self.blocks:
+            y = block(y)
+        
+        y = self.finalize(y)
         return self.fuse(query_map=y, context_seq=x)
 
 
-# ───────────────────────── Decoder ────────────────────────────
-
+# ───────────────────── decoder ────────────────────
 class SegmentDecoder(nn.Module):
-    """
-    Self-attention + up-conv decoder.
-    Input:  z ∈ ℝ^{B×(3C)×H×W}
-    Output: mel ∈ ℝ^{B×T×M}
-    """
-    def __init__(
-        self,
-        input_size:     tuple[int,int],  # (H, W)
-        output_size:    tuple[int,int],  # (T, M)
-        input_channels: int,             # 3*C
-        base_dim:       int = 32,
-        max_dim:        int = 512,
-        attn_heads:     int = 4,
-        dropout:      float = 0.1,
-    ):
+    def __init__(self, input_size, output_size, input_channels, output_channels, base_dim=32, max_dim=512):
         super().__init__()
-        H0, W0 = input_size
-        T, M   = output_size
+        
+        # Initialize the input and output sizes
+        self.input_size = input_size
+        self.output_size = output_size
+        self.output_channels = output_channels
+        self.input_channels= input_channels
+        
+        self.initialize = nn.Conv2d(input_channels, base_dim, kernel_size = 1)
 
-        # 1) project to base_dim
-        self.initialize = nn.Conv2d(input_channels, base_dim, 1)
-
-        # 2) self-attn on latent grid
         self.self_attn = CrossAttn2d(
             d_model         = base_dim,
-            num_heads       = attn_heads,
-            height          = H0,
-            width           = W0,
+            num_heads       = 4,
+            height          = input_size[0],
+            width           = input_size[1],
             mel_dim         = None,
             max_context_len = None,
             resid_scale     = 0.5,
         )
 
-        # 3) upsampling blocks
-        self.blocks, ch = self._make_blocks(input_size, output_size, base_dim, max_dim)
+        # Automatically calculate the number of residual blocks and their parameters
+        self.blocks, out_channel = self.create_residual_blocks(input_size, output_size, base_dim, max_dim)
+        
+        # Final convolution to reduce channels to output_channels
+        self.finalize = nn.Conv2d(out_channel, output_channels, kernel_size=1)
 
-        # 4) final conv to mel channel(s)
-        self.finalize = nn.Conv2d(ch, 1, 1)
-
-    def _make_blocks(self, in_size, out_size, base_dim, max_dim):
+    def create_residual_blocks(self, input_size, output_size, base_dim, max_dim):
+        # Calculate the necessary strides and channel expansions
+        in_channels = base_dim
+        current_size = input_size
         blocks = nn.ModuleList()
-        curr_ch = base_dim
-        h, w    = in_size
-        T, M    = out_size
-        while h < T or w < M:
-            sh = 2 if h < T else 1
-            sw = 2 if w < M else 1
-            out_ch = min(base_dim*2, max_dim)
-            blk    = ResidualBlockUp(curr_ch, out_ch, scale_factor=(sh, sw))
-            blocks.append(blk)
-            curr_ch = out_ch
-            h       = math.ceil(h * sh)
-            w       = math.ceil(w * sw)
-        return blocks, curr_ch
+        
+        # Keep doubling the channels and increasing the spatial size until we reach the target output size
+        while current_size[0] < output_size[0] or current_size[1] < output_size[1]:
+            stride_h = 2 if current_size[0] < output_size[0] else 1
+            stride_w = 2 if current_size[1] < output_size[1] else 1
+            
+            out_channels = min(base_dim * 2, max_dim)  # Limit channel growth to max_dim
+            block = ResidualBlockUp(in_channels, out_channels, scale_factor=(stride_h, stride_w))
+            blocks.append(block)
+            
+            # Update in_channels and current_size after applying the block
+            in_channels = out_channels
+            current_size = (math.ceil(current_size[0] * stride_h), math.ceil(current_size[1] * stride_w))
+        
+        return blocks, in_channels
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        x: (B, C_in, H, W)
-        returns mel: (B, T, M)
+        x: (B, C, W, H)  -> output (B, 1, W', H')
         """
-        y = self.initialize(x)          # (B, base_dim, H, W)
-        # y = self.self_attn(y, None)     # self-attn
-        for blk in self.blocks:
-            y = blk(y)
-        mel = self.finalize(y).squeeze(1)  # (B, T, M)
-        return mel
+        x = self.initialize(x)
+        x = self.self_attn(x, None)     # self-attn
 
+        for block in self.blocks:
+            x = block(x)
+            
+        x = self.finalize(x)
+        return x.squeeze(1)
 
-# ───────────────────────── VAE wrapper ───────────────────────
-
+    
+# ───────────────────────── VAE wrapper ─────────────────────
 class SpectrogramDiscriminator(nn.Module):
     def __init__(self, input_channels=1, base_dim=32):
         super().__init__()
-        self.conv1 = nn.Conv2d(input_channels, base_dim, 4, 2, 1)
-        self.conv2 = nn.Conv2d(base_dim, base_dim*2, 4, 2, 1)
-        self.conv3 = nn.Conv2d(base_dim*2, base_dim*4, 4, 2, 1)
-        self.conv4 = nn.Conv2d(base_dim*4, base_dim*8, 4, 2, 1)
-        self.fc    = nn.Linear(base_dim*8 * 16 * 16, 1)
-        self.sig   = nn.Sigmoid()
+        
+        self.conv1 = nn.Conv2d(input_channels, base_dim, kernel_size=4, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(base_dim, base_dim*2, kernel_size=4, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(base_dim*2, base_dim*4, kernel_size=4, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(base_dim*4, base_dim*8, kernel_size=4, stride=2, padding=1)
+        
+        self.fc = nn.Linear(base_dim*8 * 16 * 16, 1)  # Adjust based on the size of the input
+        
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x    = x.unsqueeze(1)
-        x    = F.leaky_relu(self.conv1(x), 0.2)
-        x    = F.leaky_relu(self.conv2(x), 0.2)
-        feat = x.clone()
-        x    = F.leaky_relu(self.conv3(x), 0.2)
-        x    = F.leaky_relu(self.conv4(x), 0.2)
-        x    = x.flatten(1)
-        return self.sig(self.fc(x)), feat
-
+        x = x.unsqueeze(1)  # (B, 1, W, H)
+        x = F.leaky_relu(self.conv1(x), 0.2)
+        x = F.leaky_relu(self.conv2(x), 0.2)
+        y = x
+        x = F.leaky_relu(self.conv3(x), 0.2)
+        x = F.leaky_relu(self.conv4(x), 0.2)
+        # Flatten the output for the fully connected layer
+        x = x.view(x.size(0), -1)  # Flatten the tensor to (batch_size, -1)
+        x = self.fc(x)
+        return self.sigmoid(x), y  # Output probability for real or fake
 
 class SegmentAutoEncoder(nn.Module):
     def __init__(
         self,
-        input_dim:           int = 256,
-        latent_size: tuple[int,int] = (32,32),
-        latent_channels:     int = 4,
-        network_channel_base:int = 32,
-        seq_len:             int = 256,
+        input_dim:int=128,
+        latent_size = (16,16),
+        latent_channels = 2,
+        network_channel_base: int = 16,
+        seq_len:int = 256
     ):
         super().__init__()
-        C = latent_channels
+
+        feature_channels = latent_channels
+
         self.encoder = SegmentEncoder(
-            input_size      = (seq_len, input_dim),
-            output_size     = latent_size,
-            output_channels = C,
-            base_dim        = network_channel_base,
+            input_size=(seq_len, input_dim), output_size=latent_size, output_channels=feature_channels, base_dim = network_channel_base
         )
         self.decoder = SegmentDecoder(
-            input_size      = latent_size,
-            output_size     = (seq_len, input_dim),
-            input_channels  = C * 3,
-            base_dim        = network_channel_base,
-            attn_heads      = max(1, network_channel_base // 32),
+            output_size=(seq_len, input_dim), input_size=latent_size, 
+            input_channels=feature_channels*3, output_channels=1, base_dim = network_channel_base + network_channel_base//2
         )
 
+    # ─────────────────── forward ────────────────────:
     def forward(
         self,
         tokens_prev: torch.Tensor,
         tokens_curr: torch.Tensor,
         tokens_next: torch.Tensor,
-        mask_vocal:    bool = False,
-        mask_inst:     bool = False,
+        mask_vocal = False,
+        mask_inst = False
     ):
+        
         z_prev = self.encoder(tokens_prev) 
         z_curr = self.encoder(tokens_curr)
         z_next = self.encoder(tokens_next)
@@ -362,3 +371,4 @@ class SegmentAutoEncoder(nn.Module):
         prior_loss = mean_loss + std_loss
 
         return recon, prior_loss
+
