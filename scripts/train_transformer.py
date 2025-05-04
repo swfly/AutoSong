@@ -21,7 +21,7 @@ LATENT_FILE   = "cached_latents.pt"
 LATENT_C, H, W = 4, 32, 32
 LATENT_D       = H * W
 MAX_SEQ_LEN    = 256
-BATCH_SIZE     = 4
+BATCH_SIZE     = 2
 EPOCHS         = 500_000
 
 λ_FEAT = 0.10      # feature-matching weight
@@ -62,7 +62,7 @@ txf = SoundTransformerContinuous(
     ).to(device)
 
 
-LR = 5e-4
+LR = 2e-4
 def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_steps=500_000):
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
     # Warmup scheduler
