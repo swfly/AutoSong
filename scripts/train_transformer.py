@@ -152,14 +152,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
     noise_std = 0.03  # start small; increase only if stable
     z_noisy = z_in + noise_std * torch.randn_like(z_in)
 
-    pred = txf(lyrics, z_in)                     # [B,S-1,C,D]
+    pred = txf(lyrics, z_noisy)                     # [B,S-1,C,D]
 
 
     # --------- GAN-style discrminator---------
     for param in disc.parameters():
         param.requires_grad = True  # Freeze discriminator for its update step
-    patches_real = z_in.reshape(-1, LATENT_C, H, W)
-    patches_pred = pred.reshape(-1, LATENT_C, H, W)
+    patches_real = z[:, 1:].reshape(-1, LATENT_C, H, W)
+    patches_pred = pred[:, :-1].reshape(-1, LATENT_C, H, W)
     real_labels = torch.ones(patches_real.shape[0], 1).to(patches_real.device)
     fake_labels = torch.zeros(patches_pred.shape[0], 1).to(patches_pred.device)
     real_preds, inter_data_real = disc(patches_real)
