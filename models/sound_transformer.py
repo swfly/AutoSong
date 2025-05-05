@@ -12,7 +12,16 @@ import models.vocabulary as vocab_mod
 def build_causal_mask(t: int, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Upper‑triangular (t×t) mask with 0 on diag / -inf above it (causal). Cached on CPU by default."""
     return torch.triu(torch.full((t, t), float("-inf"), device=device, dtype=dtype), diagonal=1)
-
+def build_local_causal_mask(seq_len: int, window: int, device="cpu") -> torch.Tensor:
+    """
+    Builds a lower-triangular causal mask where each position can attend
+    to only the `window` previous tokens.
+    """
+    mask = torch.full((seq_len, seq_len), float('-inf'))
+    for i in range(seq_len):
+        start = max(0, i - window)
+        mask[i, start:i + 1] = 0.0  # allow attending to self and past `window`
+    return mask.to(device)
 # ─────────────────────── planner ───────────────────────
 class LyricPlanner(nn.Module):
     """
@@ -114,8 +123,9 @@ class DecoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:  # noqa: D401
         # self‑attention (causal)
-        y = self.ln1(x)
-        x = x + self.self_attn(y, y, y, attn_mask=attn_mask, is_causal = True, need_weights=False)[0]
+        if attn_mask is not None:
+            y = self.ln1(x)
+            x = x + self.self_attn(y, y, y, attn_mask=attn_mask, is_causal = True, need_weights=False)[0]
         # cross‑attention to text memory
         y = self.ln2(x)
         x = x + self.cross_attn(y, memory, memory, is_causal = False, need_weights=False)[0]
@@ -164,6 +174,7 @@ class SoundTransformerContinuous(nn.Module):
             n_enc_layers    = 2,                  # lyric encoder depth
             n_dec_layers    = 2,                  # planner decoder depth  (set 0 => single MHA)
             max_text_len    = max_text_len,
+            dropout         = dropout
         )
 
         self.token_proj = nn.Sequential(
@@ -173,7 +184,9 @@ class SoundTransformerContinuous(nn.Module):
         )
 
         # Transformer blocks
-        self.blocks = nn.ModuleList(DecoderLayer(d_model, n_heads, dropout) for _ in range(n_layers))
+        self.blocks_global = nn.ModuleList(DecoderLayer(d_model, n_heads, dropout) for _ in range(n_layers))
+        self.blocks_local = nn.ModuleList(DecoderLayer(d_model, n_heads, dropout) for _ in range(n_layers))
+        self.fuse = DecoderLayer(d_model, n_heads, dropout=dropout)
 
         self.recon_proj = nn.Sequential(
             nn.Linear(d_model, 4 * in_channels * H * W),  # scale up to 4 * in_channels * H * W
@@ -186,6 +199,8 @@ class SoundTransformerContinuous(nn.Module):
         # cache a big causal mask on CPU; slice at runtime (saves allocation)
         full_mask = build_causal_mask(max_seq_len)
         self.register_buffer("_causal_mask", full_mask, persistent=False)
+        local_mask = build_local_causal_mask(max_seq_len, 8)
+        self.register_buffer("_causal_mask_local", local_mask, persistent=False)
 
     # ─────────────────────────── forward ────────────────────────────
 
@@ -216,10 +231,15 @@ class SoundTransformerContinuous(nn.Module):
         tokens = self.token_proj(tokens)
         # causal transformer
         L = tokens.size(1)
-        mask = self._causal_mask[:L, :L].to(latents.device)
-        for blk in self.blocks:
-            tokens = blk(tokens, plan_mem, mask)
-
+        mask_global = self._causal_mask[:L, :L].to(latents.device)
+        mask_local = self._causal_mask_local[:L, :L].to(latents.device)
+        tokens_global = tokens
+        tokens_local = tokens
+        for blk in self.blocks_global:
+            tokens_global = blk(tokens_global, plan_mem, mask_global)
+        for blk in self.blocks_local:
+            tokens_local = blk(tokens_local, plan_mem, mask_local)
+        tokens = tokens_local + self.fuse(tokens_local, tokens_global, tokens_global)
         # Project tokens back to latent patch shape
         tokens = self.recon_proj(tokens)  # [B, S, C*H*W]
 

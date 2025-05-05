@@ -58,7 +58,8 @@ txf = SoundTransformerContinuous(
     d_model=1024, 
     n_heads=16, 
     n_layers=16,
-    max_seq_len=MAX_SEQ_LEN
+    max_seq_len=MAX_SEQ_LEN,
+    dropout=0.1
     ).to(device)
 
 
@@ -156,6 +157,10 @@ for epoch in range(start_epoch, EPOCHS + 1):
     z = z[:,start:start + training_sequence_length]
     z_in  = z
     z_tgt = z
+
+    # -------- noise injection --------
+    noise_std = 0.03  # start small; increase only if stable
+    z_noisy = z_in + noise_std * torch.randn_like(z_in)
 
     pred = txf(lyrics, z_in)                     # [B,S-1,C,D]
 
