@@ -285,13 +285,13 @@ class SpectrogramDiscriminator(nn.Module):
         self.conv3 = nn.Conv2d(base_dim*2, base_dim*4, kernel_size=4, stride=2, padding=1)
         self.conv4 = nn.Conv2d(base_dim*4, base_dim*8, kernel_size=4, stride=2, padding=1)
         
-        size = int(patch_size>>3)
-
+        size = int(patch_size>>4)
         self.fc = nn.Linear(base_dim*8 * size * size, 1)  # Adjust based on the size of the input
         
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        print(x.shape)
         if len(x.shape) == 3:
             x = x.unsqueeze(1)  # (B, 1, W, H)
         x = F.leaky_relu(self.conv1(x), 0.2)

@@ -46,7 +46,7 @@ txf = SoundTransformerContinuous(
     max_seq_len=MAX_SEQ_LEN,
     dropout=0.1
     ).to(device)
-disc = SpectrogramDiscriminator(LATENT_C,16, 16).to(device)
+disc = SpectrogramDiscriminator(LATENT_C,16, 32).to(device)
 
 
 LR = 2e-4
