@@ -36,21 +36,6 @@ device = (
 # ───────── Text Encoder ───────── #
 text_enc = TextEncoder(max_tokens=512).to("cpu")
 
-# ───────── Load frozen AE & Discriminator ───────── #
-ae   = SegmentAutoEncoder(
-        input_dim=256, latent_size=(H, W), latent_channels=LATENT_C,
-        network_channel_base=32, seq_len=256
-      ).to(device).eval()
-
-disc = SpectrogramDiscriminator(1, base_dim=12).to(device).eval()
-
-vae_state = torch.load(VAE_CKPT, map_location=device)
-ae.load_state_dict(vae_state["model_state_dict"], strict=False)
-disc.load_state_dict(vae_state["discriminator_state_dict"], strict=False)
-
-for p in ae.parameters():   p.requires_grad = False
-for p in disc.parameters(): p.requires_grad = False
-
 # ───────── Transformer ───────── #
 txf = SoundTransformerContinuous(
     in_channels=LATENT_C,
