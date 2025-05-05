@@ -21,7 +21,7 @@ LATENT_FILE   = "cached_latents.pt"
 LATENT_C, H, W = 4, 32, 32
 LATENT_D       = H * W
 MAX_SEQ_LEN    = 256
-BATCH_SIZE     = 2
+BATCH_SIZE     = 1
 EPOCHS         = 500_000
 
 λ_FEAT = 0.10      # feature-matching weight
@@ -57,15 +57,17 @@ txf = SoundTransformerContinuous(
     patch_hw=(H,W),
     d_model=1024, 
     n_heads=16, 
-    n_layers=16,
+    n_layers=12,
     max_seq_len=MAX_SEQ_LEN,
     dropout=0.1
     ).to(device)
+disc = SpectrogramDiscriminator(LATENT_C,16)
 
 
 LR = 2e-4
 def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_steps=500_000):
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
+    optimizer_D = optim.AdamW(disc.parameters(), lr=base_lr, weight_decay=1e-5)
     # Warmup scheduler
     def lr_lambda(step):
         if step < warmup_steps:
@@ -75,14 +77,17 @@ def build_optimizer_and_scheduler(model, base_lr=1e-4, warmup_steps=1000, total_
             return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda)
-    # scheduler = StepLR(optimizer, step_size=1000, gamma=0.5)
-    return optimizer, scheduler
-opt, sched = build_optimizer_and_scheduler(
+    scheduler_D = LambdaLR(optimizer_D, lr_lambda)
+    return optimizer, optimizer_D, scheduler, scheduler_D
+
+optimizer, optimizer_D, scheduler, scheduler_D = build_optimizer_and_scheduler(
     txf, base_lr = LR, warmup_steps=32, total_steps=EPOCHS)
 
 start_epoch = 1
 if os.path.exists(TRANS_CKPT):
     ck = torch.load(TRANS_CKPT, map_location=device)
+    if "disc_state_dict" in ck:
+        disc.load_state_dict(ck["disc_state_dict"])
     fp16_state_dict = ck["model_state_dict"]
     fp32_state_dict = {k: v.float() for k, v in fp16_state_dict.items()}
     txf.load_state_dict(fp32_state_dict)
@@ -143,9 +148,9 @@ os.makedirs(os.path.dirname(TRANS_CKPT), exist_ok=True)
 # step = 60000000000     # how often to grow
 training_sequence_length = MAX_SEQ_LEN
 train_losses = []
+criterion = nn.BCELoss()
 for epoch in range(start_epoch, EPOCHS + 1):
     txf.train()
-    opt.zero_grad(set_to_none=True)
 
     lyrics, z = load_batch()
     # training_sequence_length = min(z.shape[1], max_len, min_len * (2 ** (epoch // step)))
@@ -164,13 +169,40 @@ for epoch in range(start_epoch, EPOCHS + 1):
 
     pred = txf(lyrics, z_in)                     # [B,S-1,C,D]
 
-    # -------- latent L1 --------
-    loss_lat = nn.functional.l1_loss(pred[:, :-1] - z[:, :-1], z[:, 1:] - z[:,:-1], reduction="mean")
 
-    loss = loss_lat
+    # --------- GAN-style discrminator---------
+    for param in disc.parameters():
+        param.requires_grad = True  # Freeze discriminator for its update step
+    patches_real = z_in.reshape(-1, LATENT_C, H, W)
+    patches_pred = pred.reshape(-1, LATENT_C, H, W)
+    real_labels = torch.ones(patches_real.shape[0], 1).to(patches_real.device)
+    fake_labels = torch.zeros(patches_pred.shape[0], 1).to(patches_pred.device)
+    real_preds, inter_data_real = disc(patches_real)
+    fake_preds, inter_data_fake = disc(patches_pred.detach())  # Detach fake data from generator
+    optimizer_D.zero_grad(set_to_none=True)
+    real_loss = criterion(real_preds, real_labels)
+    fake_loss = criterion(fake_preds, fake_labels)
+    d_loss = (real_loss + fake_loss) / 2
+    d_loss.backward()
+    optimizer_D.step()
+
+    # -------- latent L1 --------
+    for param in disc.parameters():
+        param.requires_grad = False  # Freeze discriminator for its update step
+
+    fake_preds, inter_data_fake = disc(pred)
+    real_preds, inter_data_real = disc(z_in)
+    loss_lat = nn.functional.l1_loss(pred[:, :-1] - z[:, :-1], z[:, 1:] - z[:,:-1], reduction="mean")
+    g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
+    feature_loss = nn.functional.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
+
+    loss = loss_lat + 0.1 * g_loss + 0.1 * feature_loss
+    optimizer.zero_grad(set_to_none=True)
+
     loss.backward()
-    opt.step()
-    sched.step()
+    optimizer.step()
+    scheduler.step()
+    scheduler_D.step()
     train_losses.append(loss.item())
     # print(f"[{epoch:04d}] L1 {loss_lat:.4f}")
     print(f"[{epoch:04d}] L1 {loss_lat:.4f}")
@@ -187,6 +219,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
         fp16_state_dict = {k: v.half() for k, v in txf.state_dict().items()}
         torch.save({
             "epoch": epoch,
+            "disc_state_dict": disc.state_dict(),
             "model_state_dict": fp16_state_dict,
             "train_losses": train_losses
         }, TRANS_CKPT)
