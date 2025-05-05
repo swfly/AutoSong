@@ -42,7 +42,7 @@ txf = SoundTransformerContinuous(
     patch_hw=(H,W),
     d_model=1024, 
     n_heads=16, 
-    n_layers=12,
+    n_layers=10,
     max_seq_len=MAX_SEQ_LEN,
     dropout=0.1
     ).to(device)
@@ -181,7 +181,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
     feature_loss = nn.functional.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
 
-    loss = loss_lat + 0.1 * g_loss + 0.1 * feature_loss
+    loss = loss_lat + 0.05 * g_loss + 0.05 * feature_loss
     optimizer.zero_grad(set_to_none=True)
 
     loss.backward()
