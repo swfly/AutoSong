@@ -46,7 +46,7 @@ txf = SoundTransformerContinuous(
     max_seq_len=MAX_SEQ_LEN,
     dropout=0.1
     ).to(device)
-disc = SpectrogramDiscriminator(LATENT_C,16)
+disc = SpectrogramDiscriminator(LATENT_C,16, 16).to(device)
 
 
 LR = 2e-4
@@ -175,8 +175,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
     for param in disc.parameters():
         param.requires_grad = False  # Freeze discriminator for its update step
 
-    fake_preds, inter_data_fake = disc(pred)
-    real_preds, inter_data_real = disc(z_in)
+    fake_preds, inter_data_fake = disc(patches_pred)
+    real_preds, inter_data_real = disc(patches_real)
     loss_lat = nn.functional.l1_loss(pred[:, :-1] - z[:, :-1], z[:, 1:] - z[:,:-1], reduction="mean")
     g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
     feature_loss = nn.functional.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
