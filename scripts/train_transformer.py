@@ -190,7 +190,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     scheduler_D.step()
     train_losses.append(loss.item())
     # print(f"[{epoch:04d}] L1 {loss_lat:.4f}")
-    print(f"[{epoch:04d}] L1 {loss_lat:.4f}")
+    print(f"[{epoch:04d}] | Dis Loss: {d_loss:.4f} | Gen Loss: {g_loss:.4f} | L1 Loss: {loss_lat:.4f}")
 
     # --- optional live viz every 1000 steps ---
     # if epoch % 1 == 0:

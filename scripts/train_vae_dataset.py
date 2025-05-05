@@ -206,7 +206,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     scheduler_D.step()
     scheduler.step()
 
-    print(f"[Epoch {epoch:04d}] Dis Loss: {d_loss:.4f} | Gen Loss: {g_loss:.4f} | Recon Error: {error:.4f}" )
+    print(f"[Epoch {epoch:04d}] | Dis Loss: {d_loss:.4f} | Gen Loss: {g_loss:.4f} | Recon Error: {error:.4f}" )
 
     if epoch % 200 == 0 or epoch == EPOCHS:
         torch.save({

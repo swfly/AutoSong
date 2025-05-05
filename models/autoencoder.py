@@ -291,7 +291,6 @@ class SpectrogramDiscriminator(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        print(x.shape)
         if len(x.shape) == 3:
             x = x.unsqueeze(1)  # (B, 1, W, H)
         x = F.leaky_relu(self.conv1(x), 0.2)
