@@ -86,7 +86,7 @@ tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
 model = SegmentAutoEncoder(
     input_dim=encoder.dim, latent_size=(32,32), latent_channels=8,
-    network_channel_base=32, seq_len= SEG_LEN
+    network_channel_base=64, seq_len= SEG_LEN
 ).to(device)
 discriminator = SpectrogramDiscriminator(1, base_dim = 12).to(device)
 
