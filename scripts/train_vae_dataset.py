@@ -32,6 +32,7 @@ def get_song_list(dataset_dir="dataset", max_songs=None):
     return sorted_dirs
 
 def get_triplets_from_song(path: str, mode: str = "mix") -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    print(path)
     if mode == "vocal":
         audio_file = "vocals.wav"
     elif mode == "instr":
