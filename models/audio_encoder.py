@@ -6,7 +6,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
 class AudioEncoder:
-    def __init__(self, device="cuda", sample_rate=48000, n_mels=256, n_fft=2048, hop_length=256):
+    def __init__(self, device="cuda", sample_rate=48000, n_mels=256, n_fft=4096, hop_length=192):
         self.device = device
         self.sample_rate = sample_rate
         self.n_mels = n_mels
@@ -21,14 +21,14 @@ class AudioEncoder:
             n_mels=self.n_mels,
             normalized=False,
             center=True,
-            power=1.0
+            power=2.0
         ).to(self.device)
 
         # For decoding: Griffin-Lim inversion
         self.griffin_lim = T.GriffinLim(
             n_fft=self.n_fft,
             hop_length=self.hop_length,
-            power=1.0,
+            power=2.0,
             n_iter=128
         ).to(self.device)
 

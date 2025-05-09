@@ -24,7 +24,7 @@ def visualize_latents(latents: list[torch.Tensor], window_names: list[str]):
         fig.suptitle(window_names[i])
 
         for ch in range(4):
-            axs[ch].imshow(latent[ch], cmap="viridis", aspect="auto")
+            axs[ch].imshow(latent[ch], cmap="viridis", aspect="auto", vmin=0.0,vmax=2.0)
             axs[ch].set_title(f"Channel {ch}")
             axs[ch].axis("off")
 

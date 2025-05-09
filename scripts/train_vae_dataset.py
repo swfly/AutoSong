@@ -31,38 +31,39 @@ def get_song_list(dataset_dir="dataset", max_songs=None):
 
     return sorted_dirs
 
-def get_triplets_from_song(path: str) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """
-    Load one song and return a list of (prev, curr, next) triplets.
-    """
-    cache_path = os.path.join(path, "cached_encoding.pt")
+def get_triplets_from_song(path: str, mode: str = "mix") -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if mode == "vocal":
+        audio_file = "vocals.wav"
+    elif mode == "instr":
+        audio_file = "accompaniment.wav"
+    else:
+        audio_file = next(f for f in os.listdir(path) if f.endswith((".wav", ".mp3", ".flac")) and not f.startswith(("vocal", "accomp")))
+
+    audio_path = os.path.join(path, audio_file)
+    cache_path = os.path.join(path, f"cached_{mode}.pt")
+
     if os.path.exists(cache_path):
         data = torch.load(cache_path, map_location="cpu")
         tokens = data["tokens"]
     else:
-        audio_file = next(f for f in os.listdir(path) if f.endswith(("wav", ".mp3", ".flac")))
-        audio_path = os.path.join(path, audio_file)
         tokens = encoder.encode(audio_path).cpu()
         torch.save({"tokens": tokens}, cache_path)
         print(f"💾 Saved cache to {cache_path}")
-    
+
     segments = chunk_segments(tokens, SEG_LEN)
     if len(segments) < 3:
         return []
     return [(segments[i], segments[i+1], segments[i+2]) for i in range(3, len(segments) - 3)]
 
 
+
 # ─────────────────────── setups ─────────────────────── #
 DATASET_DIR        = "dataset"
-DATASET_INST_DIR   = "dataset_inst"
-DATASET_VOCAL_DIR  = "dataset_vocal"
 INST_RATE          = 0.2  # 30% epochs use instrumental-only data
 VOCAL_RATE         = 0.2  # 20% epochs use vocal-only data
 
-normal_song_list = get_song_list(DATASET_DIR, max_songs=10000)
-inst_song_list   = get_song_list(DATASET_INST_DIR)
-vocal_song_list  = get_song_list(DATASET_VOCAL_DIR)
-n_songs = len(normal_song_list)
+song_list = get_song_list(DATASET_DIR, max_songs=10000)
+n_songs = len(song_list)
 # n_songs = 1
 # ─────────────────────── config ─────────────────────── #
 SEG_LEN = 256
@@ -84,7 +85,7 @@ encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
 model = SegmentAutoEncoder(
-    input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
+    input_dim=encoder.dim, latent_size=(32,32), latent_channels=8,
     network_channel_base=32, seq_len= SEG_LEN
 ).to(device)
 discriminator = SpectrogramDiscriminator(1, base_dim = 12).to(device)
@@ -130,20 +131,14 @@ for epoch in range(start_epoch, EPOCHS + 1):
     r = random.random()
     mask_vocal = False
     mask_inst = False
-    if r < VOCAL_RATE and vocal_song_list:
+    if r < VOCAL_RATE:
         mode = "vocal"
         mask_inst = True
-        song_list = vocal_song_list
-        base_dir = DATASET_VOCAL_DIR
-    elif r < VOCAL_RATE + INST_RATE and inst_song_list:
+    elif r < VOCAL_RATE + INST_RATE:
         mode = "instr"
         mask_vocal = True
-        song_list = inst_song_list
-        base_dir = DATASET_INST_DIR
     else:
         mode = "mix"
-        song_list = normal_song_list[:n_songs]
-        base_dir = DATASET_DIR
     print(f"[Epoch {epoch:04d}] Mode: {mode.upper():>6} | songs: {len(song_list)}")
     while len(triplets) < BATCH_SIZE:
         song_dir = random.choice([
@@ -151,8 +146,8 @@ for epoch in range(start_epoch, EPOCHS + 1):
             if os.path.isdir(os.path.join(DATASET_DIR, d))
         ])
         song_dir=random.sample(song_list, 1)[0]
-        song_path = os.path.join(base_dir, song_dir)
-        song_triplets = get_triplets_from_song(song_path)
+        song_path = os.path.join(DATASET_DIR, song_dir)
+        song_triplets = get_triplets_from_song(song_path, mode)
         if song_triplets:
             triplets.extend(random.sample(song_triplets, min(int(BATCH_SIZE / 4), min(len(song_triplets), BATCH_SIZE - len(triplets)))))
 

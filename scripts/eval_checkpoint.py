@@ -20,7 +20,7 @@ LATENT_C     = 4           # 6 blocks × 2 splits
 H, W     =  (32, 32)      # flattened H×W
 SEG_LEN      = 256          # mel frames per segment
 SEQ          = 32          # number of *new* segments to sample
-PREFIX_LEN   = 4           # seed length from dataset
+PREFIX_LEN   = 1           # seed length from dataset
 EMBED_DIM    = 512
 AUTOREGRESSION_LEN = 256
 
@@ -45,8 +45,9 @@ txf = SoundTransformerContinuous(
     patch_hw=(H,W),
     d_model=1024, 
     n_heads=16, 
-    n_layers=16,
-    max_seq_len=AUTOREGRESSION_LEN
+    n_layers=8,
+    max_seq_len=AUTOREGRESSION_LEN,
+    dropout=0.1
     ).to(device).eval()
 
 ck = torch.load(TRANS_CKPT, map_location=device)

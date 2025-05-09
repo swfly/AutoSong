@@ -40,6 +40,7 @@ song_dirs = [
     for d in sorted(os.listdir(DATASET_DIR))
     if os.path.isdir(os.path.join(DATASET_DIR, d)) and d.startswith("song_")
 ]
+song_dirs = ["dataset/song_0001"]
 
 print(f"🎼 Found {len(song_dirs)} songs in {DATASET_DIR}")
 for song_path in tqdm(song_dirs, desc="Caching latents"):

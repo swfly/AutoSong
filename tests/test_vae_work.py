@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 # add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from models.vq_vae import SegmentVAE
+from models.autoencoder import SegmentAutoEncoder, SpectrogramDiscriminator
 from utils.chunk_segments import chunk_segments
 from models.audio_encoder import AudioEncoder
 
@@ -33,7 +33,7 @@ num_segs = len(segments)
 
 # ─────────────────────────── load model ─────────────────────────
 
-model = SegmentVAE(
+model = SegmentAutoEncoder(
     input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
     network_channel_base=32, seq_len= SEG_LEN
 ).to(DEVICE)
@@ -72,7 +72,7 @@ with torch.no_grad():
 
         z_next_inst   = z_next[:, 0:C//2, :, :]
         z_next_vocal = z_next[:, C//2:, :, :]
-
+        
         z_prev_vocal *= 0.0
         z_curr_vocal *= 0.0
         z_next_vocal *= 0.0
