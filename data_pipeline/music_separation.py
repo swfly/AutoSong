@@ -1,18 +1,17 @@
 import os
 import torchaudio
 import torch
+import numpy as np
 import soundfile as sf
 from openunmix import predict
 from tqdm import tqdm  # <--- for progress bar
 
 # Choose device
+# MPS is buggy so we can only go CPU on mac
 device = (
     torch.device("cuda") if torch.cuda.is_available()
-    else torch.device("mps") if torch.backends.mps.is_available()
     else torch.device("cpu")
 )
-
-device = torch.device("cpu")
 
 # Root dataset folder
 DATASET_ROOT = "dataset"
@@ -39,22 +38,23 @@ for path, fname in tqdm(song_dirs, desc="Separating stems", unit="song"):
     try:
         # 1. Load audio
         waveform, sr = torchaudio.load(audio_file)
-        waveform = waveform.to(torch.float32)
+        waveform = waveform.to(torch.float32).to(device)
 
         # 2. Separate
         estimates = predict.separate(
             audio=waveform,
             rate=sr,
             model_str_or_path="umxl",
-            targets=["vocals", "other"],
+            targets=["vocals"],
             residual=True,
             device=device
         )
-
         # 3. Aggregate + convert
         vocals = estimates["vocals"].squeeze().cpu().permute(1, 0).numpy()
-        accomp = estimates["other"].squeeze().cpu().permute(1, 0).numpy()
-
+        accomp = estimates["residual"].squeeze().cpu().permute(1, 0).numpy()
+        pad = waveform.shape[-1] - vocals.shape[0]
+        vocals = np.pad(vocals, ((0, pad), (0, 0)), mode='constant') 
+        accomp = np.pad(accomp, ((0, pad), (0, 0)), mode='constant') 
         # 4. Save
         sf.write(os.path.join(path, "vocals.wav"), vocals, sr)
         sf.write(os.path.join(path, "accompaniment.wav"), accomp, sr)

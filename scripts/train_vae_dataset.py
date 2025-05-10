@@ -59,8 +59,8 @@ def get_triplets_from_song(path: str, mode: str = "mix") -> list[tuple[torch.Ten
 
 # ─────────────────────── setups ─────────────────────── #
 DATASET_DIR        = "dataset"
-INST_RATE          = 0.2  # 30% epochs use instrumental-only data
-VOCAL_RATE         = 0.2  # 20% epochs use vocal-only data
+INST_RATE          = 0.5  # 30% epochs use instrumental-only data
+VOCAL_RATE         = 0.5  # 20% epochs use vocal-only data
 
 song_list = get_song_list(DATASET_DIR, max_songs=10000)
 n_songs = len(song_list)
@@ -85,8 +85,8 @@ encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
 model = SegmentAutoEncoder(
-    input_dim=encoder.dim, latent_size=(32,32), latent_channels=8,
-    network_channel_base=48, seq_len= SEG_LEN
+    input_dim=encoder.dim, latent_size=(32,32), latent_channels=2,
+    network_channel_base=32, seq_len= SEG_LEN
 ).to(device)
 discriminator = SpectrogramDiscriminator(1, base_dim = 12).to(device)
 

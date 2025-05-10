@@ -337,35 +337,7 @@ class SegmentAutoEncoder(nn.Module):
         z_prev = self.encoder(tokens_prev) 
         z_curr = self.encoder(tokens_curr)
         z_next = self.encoder(tokens_next)
-
-        C = z_prev.shape[1]
-        z_prev_inst   = z_prev[:, 0:C//2, :, :]
-        z_prev_vocal = z_prev[:, C//2:, :, :]
-
-        z_curr_inst   = z_curr[:, 0:C//2, :, :]
-        z_curr_vocal = z_curr[:, C//2:, :, :]
-
-        z_next_inst   = z_next[:, 0:C//2, :, :]
-        z_next_vocal = z_next[:, C//2:, :, :]
-
-        track_loss = torch.zeros((1)).to(z_curr.device)  # Initialize track loss
-
-        if mask_vocal:
-            track_loss += (z_prev_vocal**2).mean() + (z_curr_vocal**2).mean() + (z_next_vocal**2).mean()
-            z_prev_vocal = z_prev_vocal * 0.0
-            z_curr_vocal = z_curr_vocal * 0.0
-            z_next_vocal = z_next_vocal * 0.0
-
-        if mask_inst:
-            track_loss += (z_prev_inst**2).mean() + (z_curr_inst**2).mean() + (z_next_inst**2).mean()
-            z_prev_inst = z_prev_inst * 0.0
-            z_curr_inst = z_curr_inst * 0.0
-            z_next_inst = z_next_inst * 0.0
             
-
-        z_prev = torch.cat([z_prev_inst, z_prev_vocal], dim=1)  # (B, C, H, W)
-        z_curr = torch.cat([z_curr_inst, z_curr_vocal], dim=1)
-        z_next = torch.cat([z_next_inst, z_next_vocal], dim=1)
 
         z = torch.concat([z_prev, z_curr, z_next], dim=1)  # (B, latent_dim * 3)
         recon = self.decoder(z)  # (B, T, D)
@@ -376,7 +348,7 @@ class SegmentAutoEncoder(nn.Module):
 
         mean_loss = (mu ** 2).mean()         # mean → 0
         std_loss = ((std - 1) ** 2).mean()   # std → 1
-        prior_loss = mean_loss + std_loss + track_loss
+        prior_loss = mean_loss + std_loss
 
         return recon, prior_loss
 
