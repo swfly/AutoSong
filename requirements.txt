@@ -13,6 +13,7 @@ pypinyin>=0.50.0                  # pinyin tokeniser in models/text_encoder.py
 pydub>=0.25.1                     # FLAC→WAV converter (requires system ffmpeg)
 openunmix
 whisper
+soundfile
 
 # (Optional) experiment tracking
 wandb>=0.16.0                     # uncomment if you enable logging
