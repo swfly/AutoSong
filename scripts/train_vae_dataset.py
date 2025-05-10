@@ -32,7 +32,6 @@ def get_song_list(dataset_dir="dataset", max_songs=None):
     return sorted_dirs
 
 def get_triplets_from_song(path: str, mode: str = "mix") -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    print(path)
     if mode == "vocal":
         audio_file = "vocals.wav"
     elif mode == "instr":
@@ -193,7 +192,7 @@ for epoch in range(start_epoch, EPOCHS + 1):
     g_loss = criterion(fake_preds, real_labels)  # Goal: discriminator should classify fake data as real
     error = F.l1_loss(fake_data, batch_curr, reduction='mean')
     feature_loss = F.l1_loss(inter_data_fake, inter_data_real, reduce="mean")
-    final_loss = g_loss * 0.3 + error * 0.5 + feature_loss * 0.1 + prior_loss * 0.1
+    final_loss = g_loss * 0.1 + error + feature_loss * 0.1 + prior_loss * 0.1
     
     optimizer.zero_grad()
     final_loss.backward()

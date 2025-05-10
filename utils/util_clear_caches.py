@@ -23,6 +23,6 @@ def clear_cached_encodings(dataset_dirs):
 
 if __name__ == "__main__":
     # define which datasets you want to clear
-    dataset_dirs = ["dataset", "dataset_inst", "dataset_vocal"]
+    dataset_dirs = ["dataset"]
     
     clear_cached_encodings(dataset_dirs)
