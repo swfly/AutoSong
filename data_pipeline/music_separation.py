@@ -12,6 +12,8 @@ device = (
     else torch.device("cpu")
 )
 
+device = torch.device("cpu")
+
 # Root dataset folder
 DATASET_ROOT = "dataset"
 AUDIO_EXTS = {".mp3", ".wav", ".flac"}
@@ -23,8 +25,11 @@ for song_dir in sorted(os.listdir(DATASET_ROOT)):
     if not os.path.isdir(path):
         continue
     for fname in os.listdir(path):
+        if "vocals" in fname or "accomp" in fname:
+            continue
         if os.path.splitext(fname)[1].lower() in AUDIO_EXTS:
             song_dirs.append((path, fname))
+            print(path,fname)
             break
 
 # Process each song with tqdm progress bar

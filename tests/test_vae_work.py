@@ -34,8 +34,8 @@ num_segs = len(segments)
 # ─────────────────────────── load model ─────────────────────────
 
 model = SegmentAutoEncoder(
-    input_dim=encoder.dim, latent_size=(32,32), latent_channels=4,
-    network_channel_base=32, seq_len= SEG_LEN
+    input_dim=encoder.dim, latent_size=(32,32), latent_channels=8,
+    network_channel_base=48, seq_len= SEG_LEN
 ).to(DEVICE)
 
 # load checkpoint
@@ -73,9 +73,9 @@ with torch.no_grad():
         z_next_inst   = z_next[:, 0:C//2, :, :]
         z_next_vocal = z_next[:, C//2:, :, :]
         
-        z_prev_vocal *= 0.0
-        z_curr_vocal *= 0.0
-        z_next_vocal *= 0.0
+        z_prev_inst *= 0.0
+        z_curr_inst *= 0.0
+        z_next_inst *= 0.0
 
         z_prev = torch.cat([z_prev_inst, z_prev_vocal], dim=1)  # (B, C, H, W)
         z_curr = torch.cat([z_curr_inst, z_curr_vocal], dim=1)
