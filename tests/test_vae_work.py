@@ -12,19 +12,19 @@ from utils.chunk_segments import chunk_segments
 from models.audio_encoder import AudioEncoder
 
 # ─────────────────────────── config ───────────────────────────
-DEVICE = (
+device = (
     torch.device("cuda") if torch.cuda.is_available()
     else torch.device("mps") if torch.backends.mps.is_available()
     else torch.device("cpu")
 )
-AUDIO_IN      = "dataset/song_0001/song_001.mp3"
+AUDIO_IN      = "dataset/song_0001/accompaniment.wav"
 CHECKPOINT    = "checkpoints/vqvae_dataset.pt"
 SEG_LEN       = 256  # frames per segment
 OUTPUT_WAV    = "reconstructed_ae.wav"
 
 # ─────────────────────────── load audio encoder ────────────────
 encoder = AudioEncoder(device=torch.device("cpu")) 
-tokens = encoder.encode(AUDIO_IN).to(DEVICE)  # (T_full, C)
+tokens = encoder.encode(AUDIO_IN).to(device)  # (T_full, C)
 T_full, C = tokens.shape
 
 # ───────────────────────── chunk into segments ─────────────────
@@ -33,13 +33,10 @@ num_segs = len(segments)
 
 # ─────────────────────────── load model ─────────────────────────
 
-model = SegmentAutoEncoder(
-    input_dim=encoder.dim, latent_size=(32,32), latent_channels=8,
-    network_channel_base=48, seq_len= SEG_LEN
-).to(DEVICE)
+model = SegmentAutoEncoder.create(device, SEG_LEN,encoder.dim)
 
 # load checkpoint
-ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
+ckpt = torch.load(CHECKPOINT, map_location=device)
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
 
@@ -53,33 +50,15 @@ with torch.no_grad():
         nxt  = segments[i + 1] if i < num_segs - 1 else segments[-1]
 
         # to batch
-        prev = prev.unsqueeze(0).to(DEVICE)  # [1, SEG_LEN, C]
-        curr = curr.unsqueeze(0).to(DEVICE)
-        nxt  = nxt.unsqueeze(0).to(DEVICE)
+        prev = prev.unsqueeze(0).to(device)  # [1, SEG_LEN, C]
+        curr = curr.unsqueeze(0).to(device)
+        nxt  = nxt.unsqueeze(0).to(device)
 
         # encode
         z_prev = model.encoder(prev)
         z_curr = model.encoder(curr)
         z_next = model.encoder(nxt)
 
-
-        C = z_prev.shape[1]
-        z_prev_inst   = z_prev[:, 0:C//2, :, :]
-        z_prev_vocal = z_prev[:, C//2:, :, :]
-
-        z_curr_inst   = z_curr[:, 0:C//2, :, :]
-        z_curr_vocal = z_curr[:, C//2:, :, :]
-
-        z_next_inst   = z_next[:, 0:C//2, :, :]
-        z_next_vocal = z_next[:, C//2:, :, :]
-        
-        z_prev_inst *= 0.0
-        z_curr_inst *= 0.0
-        z_next_inst *= 0.0
-
-        z_prev = torch.cat([z_prev_inst, z_prev_vocal], dim=1)  # (B, C, H, W)
-        z_curr = torch.cat([z_curr_inst, z_curr_vocal], dim=1)
-        z_next = torch.cat([z_next_inst, z_next_vocal], dim=1)
         z = torch.concat([z_prev, z_curr, z_next], dim=1)  # (B, latent_dim * 3)
         
         # decode
@@ -92,7 +71,7 @@ recon_tokens = recon_tokens[:T_full]             # trim to original length
 print(f"✅ Reconstructed")
 # ─────────────────────────── decode audio ───────────────────────
 # Now, decode from reconstructed tokens
-wave = encoder.decode(tokens.to(DEVICE))
+wave = encoder.decode(recon_tokens.to(device)[:2048])
 # wave = wave.squeeze(0).detach().cpu().numpy()
 # wave2 = encoder.decode(tokens)
 # wave2 = wave2.squeeze(0).detach().cpu().numpy()

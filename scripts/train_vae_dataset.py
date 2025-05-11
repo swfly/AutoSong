@@ -84,10 +84,7 @@ encoder = AudioEncoder(device=torch.device("cpu"), sample_rate=48000)
 # Load a sample just to get codebook count
 tmp_tokens = get_triplets_from_song("dataset/song_001")[0][0]
 
-model = SegmentAutoEncoder(
-    input_dim=encoder.dim, latent_size=(32,32), latent_channels=2,
-    network_channel_base=32, seq_len= SEG_LEN
-).to(device)
+model = SegmentAutoEncoder.create(device, SEG_LEN, encoder.dim)
 discriminator = SpectrogramDiscriminator(1, base_dim = 12).to(device)
 
 
