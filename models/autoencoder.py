@@ -324,7 +324,7 @@ class SegmentAutoEncoder(nn.Module):
             input_channels=feature_channels*3, output_channels=1, base_dim = network_channel_base + network_channel_base//2
         )
 
-    @classmethod
+    @staticmethod
     def create(device, segment_len, segment_bin):
         return SegmentAutoEncoder(
             input_dim=segment_bin, latent_size=(32,32), latent_channels=4,
